@@ -1,0 +1,393 @@
+name: codex-pr-review
+
+on:
+  workflow_call:
+    inputs:
+      shared_repository:
+        required: true
+        type: string
+      shared_ref:
+        required: true
+        type: string
+      runs_on_json:
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
+      working_directory:
+        required: false
+        type: string
+        default: repo
+      install_codex_cli:
+        required: false
+        type: boolean
+        default: true
+      node_version:
+        required: false
+        type: string
+        default: "20"
+      codex_version:
+        required: false
+        type: string
+        default: "0.114.0"
+      review_model:
+        required: false
+        type: string
+        default: gpt-5.4
+      review_timeout_seconds:
+        required: false
+        type: string
+        default: "900"
+      override_label:
+        required: false
+        type: string
+        default: codex-override-approved
+    secrets:
+      openai_api_key:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  review:
+    if: ${{ github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false }}
+    runs-on: ${{ fromJSON(inputs.runs_on_json) }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: ${{ inputs.working_directory }}
+
+      - name: Checkout shared actions
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.shared_repository }}
+          ref: ${{ inputs.shared_ref }}
+          path: _shared-actions
+
+      - name: Setup Node.js
+        if: ${{ inputs.install_codex_cli }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install Codex CLI
+        if: ${{ inputs.install_codex_cli }}
+        shell: bash
+        run: npm install --global "@openai/codex@${{ inputs.codex_version }}"
+
+      - name: Ensure runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v codex >/dev/null 2>&1 || { echo "::error::codex CLI was not found on this runner."; exit 1; }
+          command -v python3 >/dev/null 2>&1 || { echo "::error::python3 was not found on this runner."; exit 1; }
+          command -v git >/dev/null 2>&1 || { echo "::error::git was not found on this runner."; exit 1; }
+          codex --version
+          if command -v timeout >/dev/null 2>&1; then
+            echo "timeout=$(command -v timeout)"
+          elif command -v gtimeout >/dev/null 2>&1; then
+            echo "timeout=$(command -v gtimeout)"
+          else
+            echo "::error::GNU timeout (timeout or gtimeout) was not found on this runner."
+            exit 1
+          fi
+          if command -v stdbuf >/dev/null 2>&1; then
+            echo "stdbuf=$(command -v stdbuf)"
+          elif command -v gstdbuf >/dev/null 2>&1; then
+            echo "stdbuf=$(command -v gstdbuf)"
+          else
+            echo "::warning::stdbuf was not found; codex output will still run, but line buffering may be coarser."
+          fi
+
+      - name: Fetch base branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+
+      - name: Authenticate Codex with API key
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.openai_api_key }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::Missing required secret: openai_api_key."
+            exit 1
+          fi
+          printenv OPENAI_API_KEY | codex login --with-api-key
+          codex login status
+
+      - name: Run Codex review
+        id: review
+        uses: ./_shared-actions/.github/actions/run-codex-review
+        with:
+          working_directory: ${{ inputs.working_directory }}
+          review_base: ${{ github.base_ref }}
+          review_model: ${{ inputs.review_model }}
+          review_timeout_seconds: ${{ inputs.review_timeout_seconds }}
+
+      - name: Resolve admin override state
+        id: override
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        env:
+          OVERRIDE_LABEL: ${{ inputs.override_label }}
+          PULL_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const marker = "<!-- codex-review-override -->";
+            const labelName = process.env.OVERRIDE_LABEL;
+            const headSha = process.env.PULL_HEAD_SHA || "";
+            const labels = context.payload.pull_request?.labels || [];
+            const labelPresent = labels.some((label) => label.name === labelName);
+            const eventAction = context.payload.action || "";
+            const eventLabelName = context.payload.label?.name || "";
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const audit = comments
+              .filter((comment) => comment.user?.type === "Bot" && comment.body?.includes(marker))
+              .sort(
+                (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+              )[0];
+
+            const body = audit?.body || "";
+            const statusMatch = body.match(/^Status:\s*([^\n\r]+)/m);
+            const approvedByMatch = body.match(/^Approved by:\s*@([^\s]+)/m);
+            const approvedShaMatch = body.match(/^Head SHA:\s*`?([0-9a-f]{7,40})`?/m);
+
+            const recordedStatus = (statusMatch?.[1] || "").trim().toLowerCase();
+            const approvedBy = approvedByMatch?.[1] || "";
+            const approvedSha = approvedShaMatch?.[1] || "";
+            const auditActive =
+              labelPresent && recordedStatus === "active" && approvedSha === headSha;
+            const stale =
+              labelPresent &&
+              recordedStatus === "active" &&
+              approvedSha !== "" &&
+              approvedSha !== headSha;
+            let manualEventActive = false;
+            let manualEventApprovedBy = "";
+
+            if (!auditActive && eventAction === "labeled" && eventLabelName === labelName) {
+              const sender = context.payload.sender?.login || "";
+              if (sender) {
+                const permissionResponse = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner,
+                  repo,
+                  username: sender,
+                });
+                if (permissionResponse.data.permission === "admin") {
+                  manualEventActive = true;
+                  manualEventApprovedBy = sender;
+                }
+              }
+            }
+
+            const active = auditActive || manualEventActive;
+            const overrideSource = auditActive
+              ? "audit-comment"
+              : manualEventActive
+                ? "manual-label-event"
+                : "none";
+
+            core.setOutput("label_present", labelPresent ? "1" : "0");
+            core.setOutput("active", active ? "1" : "0");
+            core.setOutput("stale", stale ? "1" : "0");
+            core.setOutput("approved_by", approvedBy || manualEventApprovedBy);
+            core.setOutput("approved_sha", approvedSha || (manualEventActive ? headSha : ""));
+            core.setOutput("source", overrideSource);
+
+      - name: Upload Codex review artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-pr-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ inputs.working_directory }}/codex-review.txt
+            ${{ inputs.working_directory }}/codex-parse.env
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upsert PR comment with Codex output
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        env:
+          OUTPUT_PATH: ${{ inputs.working_directory }}/codex-review.txt
+          CODEX_EXIT_CODE: ${{ steps.review.outputs.codex_exit_code }}
+          P0_COUNT: ${{ steps.review.outputs.p0_count }}
+          P1_COUNT: ${{ steps.review.outputs.p1_count }}
+          P2_COUNT: ${{ steps.review.outputs.p2_count }}
+          P3_COUNT: ${{ steps.review.outputs.p3_count }}
+          PARSE_INCONCLUSIVE: ${{ steps.review.outputs.parse_inconclusive }}
+          PARSE_FAILED: ${{ steps.review.outputs.parse_failed }}
+          OVERRIDE_ACTIVE: ${{ steps.override.outputs.active }}
+          OVERRIDE_STALE: ${{ steps.override.outputs.stale }}
+          OVERRIDE_APPROVED_BY: ${{ steps.override.outputs.approved_by }}
+          OVERRIDE_APPROVED_SHA: ${{ steps.override.outputs.approved_sha }}
+          OVERRIDE_SOURCE: ${{ steps.override.outputs.source }}
+        with:
+          script: |
+            const fs = require("fs");
+
+            const marker = "<!-- codex-pr-review -->";
+            const outputPath = process.env.OUTPUT_PATH || "repo/codex-review.txt";
+            let output = "codex-review.txt not found.";
+
+            if (fs.existsSync(outputPath)) {
+              output = fs.readFileSync(outputPath, "utf8");
+            }
+
+            const exitCode = process.env.CODEX_EXIT_CODE || "1";
+            const p0 = Number(process.env.P0_COUNT || "0");
+            const p1 = Number(process.env.P1_COUNT || "0");
+            const p2 = Number(process.env.P2_COUNT || "0");
+            const p3 = Number(process.env.P3_COUNT || "0");
+            const parseInconclusive = process.env.PARSE_INCONCLUSIVE === "1";
+            const parseFailed = process.env.PARSE_FAILED === "1";
+            const overrideActive = process.env.OVERRIDE_ACTIVE === "1";
+            const overrideStale = process.env.OVERRIDE_STALE === "1";
+            const overrideApprovedBy = process.env.OVERRIDE_APPROVED_BY || "";
+            const overrideApprovedSha = process.env.OVERRIDE_APPROVED_SHA || "";
+            const overrideSource = process.env.OVERRIDE_SOURCE || "none";
+            const timedOut = exitCode === "124" || exitCode === "137";
+            const totalFindings = p0 + p1 + p2 + p3;
+            const isBlocking =
+              exitCode !== "0" ||
+              p0 > 0 ||
+              parseInconclusive ||
+              parseFailed ||
+              (p1 > 0 && !overrideActive);
+            const status = isBlocking
+              ? "blocking"
+              : overrideActive && p1 > 0
+                ? "admin override applied"
+                : "non-blocking";
+            const overrideStatus = overrideActive ? "active" : overrideStale ? "stale" : "none";
+            const overrideSummary = overrideApprovedBy
+              ? `\`${overrideStatus}\` by @${overrideApprovedBy}`
+              : `\`${overrideStatus}\``;
+            const shouldComment =
+              exitCode !== "0" ||
+              totalFindings > 0 ||
+              parseInconclusive ||
+              parseFailed ||
+              overrideStatus !== "none";
+
+            const findings = output
+              .split(/\r?\n/)
+              .filter((line) => /^\s*-\s*\[P[0-3]\]/.test(line))
+              .map((line) => line.trim())
+              .slice(0, 5);
+
+            const findingsSection =
+              findings.length > 0 ? findings.map((line) => `- ${line}`).join("\n") : "- none";
+
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+
+            const body = [
+              marker,
+              "### Codex PR review",
+              "",
+              `Result: **${status}**`,
+              `Exit code: \`${exitCode}\``,
+              `Timed out: \`${timedOut ? "yes" : "no"}\``,
+              `Blocking findings: P0 \`${p0}\` | P1 \`${p1}\``,
+              `Other findings: P2 \`${p2}\` | P3 \`${p3}\``,
+              `Parser status: \`${parseFailed ? "failed" : "ok"}\``,
+              `Parser fallback used: \`${parseInconclusive ? "yes" : "no"}\``,
+              `Admin override: ${overrideSummary}`,
+              `Override source: \`${overrideSource}\``,
+              `Override SHA: \`${overrideApprovedSha || "n/a"}\``,
+              "",
+              "**Top findings**",
+              findingsSection,
+              "",
+              `[Workflow logs](${runUrl})`,
+            ].join("\n");
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const existing = comments.find(
+              (comment) => comment.user?.type === "Bot" && comment.body?.includes(marker),
+            );
+
+            if (!shouldComment) {
+              if (existing) {
+                await github.rest.issues.deleteComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                });
+              }
+              return;
+            }
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+      - name: Fail if Codex command failed
+        if: ${{ steps.review.outputs.codex_exit_code != '0' }}
+        shell: bash
+        run: |
+          echo "::error::codex review command failed (exit code ${{ steps.review.outputs.codex_exit_code }})."
+          exit 1
+
+      - name: Fail if Codex parse failed
+        if: ${{ steps.review.outputs.parse_failed == '1' }}
+        shell: bash
+        run: |
+          echo "::error::Failed to parse codex-review.txt."
+          exit 1
+
+      - name: Fail on P0 findings or inconclusive parse
+        if: ${{ steps.review.outputs.p0_count != '0' || steps.review.outputs.parse_inconclusive == '1' }}
+        shell: bash
+        run: |
+          echo "::error::Blocking Codex findings detected (P0=${{ steps.review.outputs.p0_count }}, parse_inconclusive=${{ steps.review.outputs.parse_inconclusive }})."
+          exit 1
+
+      - name: Fail on P1 findings without admin override
+        if: ${{ steps.review.outputs.p1_count != '0' && steps.override.outputs.active != '1' }}
+        shell: bash
+        run: |
+          echo "::error::Blocking Codex P1 findings detected without an active admin override (P1=${{ steps.review.outputs.p1_count }})."
+          exit 1
