@@ -168,8 +168,10 @@ cat > "$schema_path" <<'JSON'
             "minimum": 1
           },
           "previous_fingerprint": {
-            "type": "string",
-            "minLength": 1
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -179,7 +181,8 @@ cat > "$schema_path" <<'JSON'
           "priority",
           "path",
           "start_line",
-          "end_line"
+          "end_line",
+          "previous_fingerprint"
         ],
         "additionalProperties": false
       }
@@ -233,6 +236,7 @@ Output requirements:
 - Keep \`title\` short and direct.
 - Make \`body\` concise, specific, and actionable.
 - When a currently valid finding matches a previously open finding, copy its \`previous_fingerprint\` exactly into the result.
+- Set \`previous_fingerprint\` to \`null\` for genuinely new findings.
 - After revalidating any previously open findings, continue looking for additional new issues.
 - Return only findings that are still valid on the current HEAD. Omit previously open findings that are now resolved.
 - If there are no actionable findings, return an empty \`findings\` array.
