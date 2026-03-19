@@ -1,0 +1,220 @@
+name: codex-review-override
+
+on:
+  workflow_call:
+    inputs:
+      override_label:
+        required: false
+        type: string
+        default: codex-override-approved
+      review_workflow_file:
+        required: false
+        type: string
+        default: codex-pr-review.yml
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  override:
+    if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '/codex-override') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apply or clear Codex review override
+        uses: actions/github-script@v7
+        env:
+          COMMAND_BODY: ${{ github.event.comment.body }}
+          OVERRIDE_LABEL: ${{ inputs.override_label }}
+          REVIEW_WORKFLOW_FILE: ${{ inputs.review_workflow_file }}
+        with:
+          script: |
+            const marker = "<!-- codex-review-override -->";
+            const commandBody = (process.env.COMMAND_BODY || "").trim();
+            const labelName = process.env.OVERRIDE_LABEL || "codex-override-approved";
+            const reviewWorkflowFile = process.env.REVIEW_WORKFLOW_FILE || "codex-pr-review.yml";
+            const match = commandBody.match(/^\/codex-override(?:\s+([\s\S]+))?$/);
+
+            if (!match) {
+              core.setFailed("Unsupported codex override command.");
+              return;
+            }
+
+            const argument = (match[1] || "").trim();
+            const clearRequested = /^clear$/i.test(argument);
+
+            if (!clearRequested && argument.length === 0) {
+              core.setFailed("Usage: /codex-override <reason> or /codex-override clear");
+              return;
+            }
+
+            const actor = context.actor;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const permissionResponse = await github.rest.repos.getCollaboratorPermissionLevel({
+              owner,
+              repo,
+              username: actor,
+            });
+            const permission = permissionResponse.data.permission || "none";
+
+            if (permission !== "admin") {
+              core.setFailed(`Only admins can manage Codex overrides. Current permission: ${permission}.`);
+              return;
+            }
+
+            const pull = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: issue_number,
+            });
+            const headSha = pull.data.head.sha;
+            const headRef = pull.data.head.ref;
+
+            try {
+              await github.rest.issues.getLabel({
+                owner,
+                repo,
+                name: labelName,
+              });
+            } catch (error) {
+              if (error.status !== 404) {
+                throw error;
+              }
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: labelName,
+                color: "B60205",
+                description: "Admin-approved override for Codex P1 findings on the current PR head",
+              });
+            }
+
+            if (clearRequested) {
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number,
+                  name: labelName,
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
+            } else {
+              await github.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number,
+                labels: [labelName],
+              });
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(
+              (comment) => comment.user?.type === "Bot" && comment.body?.includes(marker),
+            );
+
+            const timestamp = new Date().toISOString();
+            const quotedReason =
+              argument.length > 0
+                ? argument.split(/\r?\n/).map((line) => `> ${line}`).join("\n")
+                : "> clear";
+
+            const body = clearRequested
+              ? [
+                  marker,
+                  "### Codex review override",
+                  "",
+                  "Status: cleared",
+                  `Cleared by: @${actor}`,
+                  `Cleared at: ${timestamp}`,
+                  `Head SHA: \`${headSha}\``,
+                  `Head ref: \`${headRef}\``,
+                  "",
+                  "Reason:",
+                  quotedReason,
+                ].join("\n")
+              : [
+                  marker,
+                  "### Codex review override",
+                  "",
+                  "Status: active",
+                  `Approved by: @${actor}`,
+                  `Approved at: ${timestamp}`,
+                  `Head SHA: \`${headSha}\``,
+                  `Head ref: \`${headRef}\``,
+                  "Scope: P1 findings only",
+                  "",
+                  "Reason:",
+                  quotedReason,
+                ].join("\n");
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body,
+              });
+            }
+
+            const runsResponse = await github.request(
+              "GET /repos/{owner}/{repo}/actions/workflows/{workflow_id}/runs",
+              {
+                owner,
+                repo,
+                workflow_id: reviewWorkflowFile,
+                event: "pull_request",
+                per_page: 50,
+              },
+            );
+            const runs = runsResponse.data.workflow_runs || [];
+            const targetRun = runs
+              .filter(
+                (run) =>
+                  run.head_sha === headSha &&
+                  (run.pull_requests || []).some((pullRequest) => pullRequest.number === issue_number),
+              )
+              .sort(
+                (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+              )[0];
+
+            if (!targetRun) {
+              core.warning(`No ${reviewWorkflowFile} run found for PR #${issue_number} at ${headSha}.`);
+              return;
+            }
+
+            if (targetRun.status !== "completed") {
+              core.notice(
+                `${reviewWorkflowFile} run ${targetRun.id} is currently ${targetRun.status}; no rerun needed.`,
+              );
+              return;
+            }
+
+            await github.request("POST /repos/{owner}/{repo}/actions/runs/{run_id}/rerun", {
+              owner,
+              repo,
+              run_id: targetRun.id,
+            });
+
+            core.notice(
+              `${clearRequested ? "Cleared" : "Applied"} Codex override and re-ran workflow run ${targetRun.id}.`,
+            );

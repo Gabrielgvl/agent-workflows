@@ -1,0 +1,51 @@
+name: validate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint workflows
+        uses: rhysd/actionlint@v1
+
+      - name: Validate shell scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r script_path; do
+            bash -n "$script_path"
+          done < <(find . -type f -name '*.sh' | sort)
+
+      - name: Validate executable entrypoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x .github/codex-review/run_codex_review.sh
+
+      - name: Validate Python syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile $(git ls-files '*.py')
+
+      - name: Run helper tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests -p 'test_*.py'

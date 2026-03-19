@@ -1,0 +1,420 @@
+name: codex-pr-review
+
+on:
+  workflow_call:
+    inputs:
+      runs_on_json:
+        required: false
+        type: string
+        default: '["self-hosted"]'
+      working_directory:
+        required: false
+        type: string
+        default: repo
+      install_codex_cli:
+        required: false
+        type: boolean
+        default: true
+      node_version:
+        required: false
+        type: string
+        default: "20"
+      codex_version:
+        required: false
+        type: string
+        default: "0.115.0"
+      review_model:
+        required: false
+        type: string
+        default: gpt-5.4
+      review_timeout_seconds:
+        required: false
+        type: string
+        default: "900"
+      review_reasoning_effort:
+        required: false
+        type: string
+        default: low
+      review_reasoning_summary:
+        required: false
+        type: string
+        default: ""
+      review_verbosity:
+        required: false
+        type: string
+        default: ""
+      max_inline_comments:
+        required: false
+        type: string
+        default: "10"
+      override_label:
+        required: false
+        type: string
+        default: codex-override-approved
+    secrets:
+      codex_auth_json_b64:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: codex-pr-review-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: ${{ github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false }}
+    runs-on: ${{ fromJSON(inputs.runs_on_json) }}
+    timeout-minutes: 25
+    steps:
+      - name: Validate review inputs
+        shell: bash
+        env:
+          REVIEW_MODEL: ${{ inputs.review_model }}
+          REVIEW_TIMEOUT_SECONDS: ${{ inputs.review_timeout_seconds }}
+          REVIEW_REASONING_EFFORT: ${{ inputs.review_reasoning_effort }}
+          REVIEW_REASONING_SUMMARY: ${{ inputs.review_reasoning_summary }}
+          REVIEW_VERBOSITY: ${{ inputs.review_verbosity }}
+          MAX_INLINE_COMMENTS: ${{ inputs.max_inline_comments }}
+          CODEX_AUTH_JSON_B64: ${{ secrets.codex_auth_json_b64 }}
+        run: |
+          set -euo pipefail
+
+          require_choice() {
+            local value="$1"
+            local label="$2"
+            shift 2
+            local candidate
+
+            if [[ -z "$value" ]]; then
+              echo "::error::${label} must not be empty."
+              exit 1
+            fi
+
+            for candidate in "$@"; do
+              if [[ "$value" == "$candidate" ]]; then
+                return 0
+              fi
+            done
+
+            echo "::error::Invalid ${label}: ${value}. Allowed values: $*"
+            exit 1
+          }
+
+          require_optional_choice() {
+            local value="$1"
+            local label="$2"
+            shift 2
+            if [[ -z "$value" ]]; then
+              return 0
+            fi
+            require_choice "$value" "$label" "$@"
+          }
+
+          if [[ -z "$REVIEW_MODEL" ]]; then
+            echo "::error::review_model must not be empty."
+            exit 1
+          fi
+
+          if ! [[ "$REVIEW_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || [[ "$REVIEW_TIMEOUT_SECONDS" -lt 1 ]]; then
+            echo "::error::review_timeout_seconds must be a positive integer."
+            exit 1
+          fi
+
+          if ! [[ "$MAX_INLINE_COMMENTS" =~ ^[0-9]+$ ]] || [[ "$MAX_INLINE_COMMENTS" -lt 1 ]] || [[ "$MAX_INLINE_COMMENTS" -gt 20 ]]; then
+            echo "::error::max_inline_comments must be an integer between 1 and 20."
+            exit 1
+          fi
+
+          require_choice "$REVIEW_REASONING_EFFORT" "review_reasoning_effort" minimal low medium high xhigh
+          require_optional_choice "$REVIEW_REASONING_SUMMARY" "review_reasoning_summary" auto concise detailed none
+          require_optional_choice "$REVIEW_VERBOSITY" "review_verbosity" low medium high
+
+          if [[ -z "${CODEX_AUTH_JSON_B64:-}" ]]; then
+            echo "::error::codex_auth_json_b64 is required."
+            exit 1
+          fi
+
+      - name: Resolve workflow source
+        id: workflow_source
+        shell: bash
+        env:
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          workflow_ref="${WORKFLOW_REF:?github.workflow_ref was not set}"
+          repository="${workflow_ref%%/.github/workflows/*}"
+          ref="${workflow_ref#*@}"
+
+          if [[ "$repository" == "$workflow_ref" || "$ref" == "$workflow_ref" || -z "$repository" || -z "$ref" ]]; then
+            echo "::error::Unable to resolve workflow source from github.workflow_ref=${workflow_ref}"
+            exit 1
+          fi
+
+          echo "repository=$repository" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: ${{ inputs.working_directory }}
+
+      - name: Checkout workflow source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.workflow_source.outputs.repository }}
+          ref: ${{ steps.workflow_source.outputs.ref }}
+          path: _workflow-source
+          fetch-depth: 1
+
+      - name: Setup Node.js
+        if: ${{ inputs.install_codex_cli }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Install Codex CLI
+        if: ${{ inputs.install_codex_cli }}
+        shell: bash
+        run: npm install --global "@openai/codex@${{ inputs.codex_version }}"
+
+      - name: Ensure runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v codex >/dev/null 2>&1 || { echo "::error::codex CLI was not found on this runner."; exit 1; }
+          command -v python3 >/dev/null 2>&1 || { echo "::error::python3 was not found on this runner."; exit 1; }
+          command -v git >/dev/null 2>&1 || { echo "::error::git was not found on this runner."; exit 1; }
+          codex --version
+          if command -v timeout >/dev/null 2>&1; then
+            echo "timeout=$(command -v timeout)"
+          elif command -v gtimeout >/dev/null 2>&1; then
+            echo "timeout=$(command -v gtimeout)"
+          else
+            echo "::error::GNU timeout (timeout or gtimeout) was not found on this runner."
+            exit 1
+          fi
+          if command -v stdbuf >/dev/null 2>&1; then
+            echo "stdbuf=$(command -v stdbuf)"
+          elif command -v gstdbuf >/dev/null 2>&1; then
+            echo "stdbuf=$(command -v gstdbuf)"
+          else
+            echo "::warning::stdbuf was not found; codex output will still run, but line buffering may be coarser."
+          fi
+
+      - name: Fetch base branch
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+
+      - name: Run structured Codex review
+        id: review
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          WORKFLOW_HELPERS_DIR: ${{ github.workspace }}/_workflow-source/.github/codex-review
+          CODEX_AUTH_JSON_B64: ${{ secrets.codex_auth_json_b64 }}
+          CODEX_REVIEW_RAW_OUTPUT_PATH: codex-review.json
+          CODEX_REVIEW_LOG_PATH: codex-review.log
+          CODEX_REVIEW_SCHEMA_PATH: codex-review.schema.json
+          CODEX_REVIEW_PROMPT_PATH: codex-review.prompt.md
+          CODEX_REVIEW_DIFF_PATH: codex-review.diff
+          CODEX_REVIEW_CHANGED_FILES_PATH: codex-changed-files.txt
+          CODEX_REVIEW_BASE: ${{ github.base_ref }}
+          CODEX_REVIEW_MODEL: ${{ inputs.review_model }}
+          CODEX_REVIEW_TIMEOUT_SECONDS: ${{ inputs.review_timeout_seconds }}
+          CODEX_REVIEW_REASONING_EFFORT: ${{ inputs.review_reasoning_effort }}
+          CODEX_REVIEW_REASONING_SUMMARY: ${{ inputs.review_reasoning_summary }}
+          CODEX_REVIEW_VERBOSITY: ${{ inputs.review_verbosity }}
+        run: |
+          set +e
+          "${WORKFLOW_HELPERS_DIR}/run_codex_review.sh"
+          rc=$?
+          set -e
+          echo "codex_exit_code=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Collect Codex review state
+        id: state
+        if: ${{ always() }}
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/_workflow-source/.github/codex-review
+          WORKFLOW_HELPERS_DIR: ${{ github.workspace }}/_workflow-source/.github/codex-review
+          CODEX_REVIEW_RAW_OUTPUT_PATH: codex-review.json
+          CODEX_REVIEW_DIFF_PATH: codex-review.diff
+          CODEX_REVIEW_STATE_PATH: codex-review-state.json
+          CODEX_REVIEW_STATE_ENV_PATH: codex-review-state.env
+          CODEX_REVIEW_MODEL: ${{ inputs.review_model }}
+          CODEX_REVIEW_BASE: ${{ github.base_ref }}
+          CODEX_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CODEX_REVIEW_EXIT_CODE: ${{ steps.review.outputs.codex_exit_code }}
+          CODEX_REVIEW_MAX_INLINE_COMMENTS: ${{ inputs.max_inline_comments }}
+        run: |
+          set -euo pipefail
+          python3 "${WORKFLOW_HELPERS_DIR}/collect_codex_review_state.py"
+          # shellcheck disable=SC1091
+          source codex-review-state.env
+          echo "p0_count=$p0_count" >> "$GITHUB_OUTPUT"
+          echo "p1_count=$p1_count" >> "$GITHUB_OUTPUT"
+          echo "p2_count=$p2_count" >> "$GITHUB_OUTPUT"
+          echo "p3_count=$p3_count" >> "$GITHUB_OUTPUT"
+          echo "parse_failed=$parse_failed" >> "$GITHUB_OUTPUT"
+          echo "findings_total=$findings_total" >> "$GITHUB_OUTPUT"
+          echo "selected_inline_count=$selected_inline_count" >> "$GITHUB_OUTPUT"
+          echo "unplaced_inline_count=$unplaced_inline_count" >> "$GITHUB_OUTPUT"
+          echo "truncated_inline_count=$truncated_inline_count" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve admin override state
+        id: override
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        env:
+          OVERRIDE_LABEL: ${{ inputs.override_label }}
+          PULL_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        with:
+          script: |
+            const marker = "<!-- codex-review-override -->";
+            const labelName = process.env.OVERRIDE_LABEL;
+            const headSha = process.env.PULL_HEAD_SHA || "";
+            const labels = context.payload.pull_request?.labels || [];
+            const labelPresent = labels.some((label) => label.name === labelName);
+            const eventAction = context.payload.action || "";
+            const eventLabelName = context.payload.label?.name || "";
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const audit = comments
+              .filter((comment) => comment.user?.type === "Bot" && comment.body?.includes(marker))
+              .sort(
+                (a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime(),
+              )[0];
+
+            const body = audit?.body || "";
+            const statusMatch = body.match(/^Status:\s*([^\n\r]+)/m);
+            const approvedByMatch = body.match(/^Approved by:\s*@([^\s]+)/m);
+            const approvedShaMatch = body.match(/^Head SHA:\s*`?([0-9a-f]{7,40})`?/m);
+
+            const recordedStatus = (statusMatch?.[1] || "").trim().toLowerCase();
+            const approvedBy = approvedByMatch?.[1] || "";
+            const approvedSha = approvedShaMatch?.[1] || "";
+            const auditActive =
+              labelPresent && recordedStatus === "active" && approvedSha === headSha;
+            const stale =
+              labelPresent &&
+              recordedStatus === "active" &&
+              approvedSha !== "" &&
+              approvedSha !== headSha;
+            let manualEventActive = false;
+            let manualEventApprovedBy = "";
+
+            if (!auditActive && eventAction === "labeled" && eventLabelName === labelName) {
+              const sender = context.payload.sender?.login || "";
+              if (sender) {
+                const permissionResponse = await github.rest.repos.getCollaboratorPermissionLevel({
+                  owner,
+                  repo,
+                  username: sender,
+                });
+                if (permissionResponse.data.permission === "admin") {
+                  manualEventActive = true;
+                  manualEventApprovedBy = sender;
+                }
+              }
+            }
+
+            const active = auditActive || manualEventActive;
+            const overrideSource = auditActive
+              ? "audit-comment"
+              : manualEventActive
+                ? "manual-label-event"
+                : "none";
+
+            core.setOutput("label_present", labelPresent ? "1" : "0");
+            core.setOutput("active", active ? "1" : "0");
+            core.setOutput("stale", stale ? "1" : "0");
+            core.setOutput("approved_by", approvedBy || manualEventApprovedBy);
+            core.setOutput("approved_sha", approvedSha || (manualEventActive ? headSha : ""));
+            core.setOutput("source", overrideSource);
+
+      - name: Upload Codex review artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-pr-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ inputs.working_directory }}/codex-review.json
+            ${{ inputs.working_directory }}/codex-review.log
+            ${{ inputs.working_directory }}/codex-review.schema.json
+            ${{ inputs.working_directory }}/codex-review.prompt.md
+            ${{ inputs.working_directory }}/codex-review.diff
+            ${{ inputs.working_directory }}/codex-changed-files.txt
+            ${{ inputs.working_directory }}/codex-review-state.json
+            ${{ inputs.working_directory }}/codex-review-state.env
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Publish Codex review comments
+        if: ${{ always() }}
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/_workflow-source/.github/codex-review
+          WORKFLOW_HELPERS_DIR: ${{ github.workspace }}/_workflow-source/.github/codex-review
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_PULL_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GITHUB_ARTIFACT_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts
+          CODEX_REVIEW_STATE_PATH: codex-review-state.json
+          OVERRIDE_ACTIVE: ${{ steps.override.outputs.active }}
+          OVERRIDE_STALE: ${{ steps.override.outputs.stale }}
+          OVERRIDE_APPROVED_BY: ${{ steps.override.outputs.approved_by }}
+          OVERRIDE_APPROVED_SHA: ${{ steps.override.outputs.approved_sha }}
+          OVERRIDE_SOURCE: ${{ steps.override.outputs.source }}
+        run: |
+          set -euo pipefail
+          python3 "${WORKFLOW_HELPERS_DIR}/publish_codex_review.py"
+
+      - name: Fail if Codex command failed
+        if: ${{ steps.review.outputs.codex_exit_code != '0' }}
+        shell: bash
+        run: |
+          echo "::error::codex structured review command failed (exit code ${{ steps.review.outputs.codex_exit_code }})."
+          exit 1
+
+      - name: Fail if structured review output is invalid
+        if: ${{ steps.state.outputs.parse_failed == '1' }}
+        shell: bash
+        run: |
+          echo "::error::Failed to validate the structured Codex review output."
+          exit 1
+
+      - name: Fail on P0 findings
+        if: ${{ steps.state.outputs.p0_count != '0' }}
+        shell: bash
+        run: |
+          echo "::error::Blocking Codex findings detected (P0=${{ steps.state.outputs.p0_count }})."
+          exit 1
+
+      - name: Fail on P1 findings without admin override
+        if: ${{ steps.state.outputs.p1_count != '0' && steps.override.outputs.active != '1' }}
+        shell: bash
+        run: |
+          echo "::error::Blocking Codex P1 findings detected without an active admin override (P1=${{ steps.state.outputs.p1_count }})."
+          exit 1
