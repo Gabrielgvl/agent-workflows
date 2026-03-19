@@ -20,6 +20,11 @@ timeout_bin=""
 stdbuf_bin=""
 heartbeat_seconds="${CODEX_REVIEW_HEARTBEAT_SECONDS:-30}"
 heartbeat_pid=""
+codex_bin=""
+wrapped_codex_bin=""
+toolchain_wrapper_dir=""
+original_home="${HOME:-}"
+original_volta_home="${VOLTA_HOME:-}"
 
 mkdir -p "$runner_temp_root"
 rm -f \
@@ -79,6 +84,11 @@ require_command mktemp
 require_command python3
 resolve_timeout_bin
 resolve_stdbuf_bin
+codex_bin="$(command -v codex)"
+
+if [[ -z "$original_volta_home" && -n "$original_home" && -d "$original_home/.volta" ]]; then
+  original_volta_home="$original_home/.volta"
+fi
 
 if [[ -z "$review_base" ]]; then
   printf 'ERROR: CODEX_REVIEW_BASE is required.\n' > "$review_log_path"
@@ -230,6 +240,8 @@ EOF
 
 codex_home_parent="$(mktemp -d "${runner_temp_root%/}/codex-home.XXXXXX")"
 codex_zdotdir="$(mktemp -d "${runner_temp_root%/}/codex-zdotdir.XXXXXX")"
+toolchain_wrapper_dir="$(mktemp -d "${runner_temp_root%/}/codex-bin.XXXXXX")"
+wrapped_codex_bin="$toolchain_wrapper_dir/codex"
 
 cleanup() {
   if [[ -n "${heartbeat_pid:-}" ]]; then
@@ -237,7 +249,7 @@ cleanup() {
     wait "$heartbeat_pid" 2>/dev/null || true
     heartbeat_pid=""
   fi
-  rm -rf "$codex_home_parent" "$codex_zdotdir"
+  rm -rf "$codex_home_parent" "$codex_zdotdir" "$toolchain_wrapper_dir"
 }
 trap cleanup EXIT
 
@@ -249,15 +261,31 @@ mkdir -p \
 chmod 700 \
   "$codex_home_parent" \
   "$codex_home_parent/.codex" \
-  "$codex_zdotdir"
+  "$codex_zdotdir" \
+  "$toolchain_wrapper_dir"
 : > "$codex_home_parent/.codex/config.toml"
 : > "$codex_zdotdir/.zshenv"
+
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -euo pipefail'
+  if [[ -n "$original_volta_home" ]]; then
+    printf 'export VOLTA_HOME=%q\n' "$original_volta_home"
+    printf 'export PATH=%q:$PATH\n' "$original_volta_home/bin"
+  fi
+  printf 'exec %q "$@"\n' "$codex_bin"
+} > "$wrapped_codex_bin"
+chmod 755 "$wrapped_codex_bin"
 
 export HOME="$codex_home_parent"
 export XDG_CONFIG_HOME="$codex_home_parent/.config"
 export XDG_CACHE_HOME="$codex_home_parent/.cache"
 export XDG_STATE_HOME="$codex_home_parent/.local/state"
 export ZDOTDIR="$codex_zdotdir"
+export PATH="$toolchain_wrapper_dir:$PATH"
+if [[ -n "$original_volta_home" ]]; then
+  export VOLTA_HOME="$original_volta_home"
+fi
 
 codex_auth_path="$codex_home_parent/.codex/auth.json"
 
@@ -315,6 +343,14 @@ if ! validate_auth_json "$codex_auth_path" > /dev/null 2>&1; then
 fi
 log_info "Restored isolated Codex auth bundle."
 
+if ! "$wrapped_codex_bin" --version >/dev/null 2>&1; then
+  printf 'ERROR: unable to execute codex after HOME isolation.\n' >> "$review_log_path"
+  "$wrapped_codex_bin" --version >> "$review_log_path" 2>&1 || true
+  cat "$review_log_path"
+  exit 2
+fi
+log_info "Pinned Codex executable for isolated HOME."
+
 # Keep the Codex subprocess isolated from runner-exported CODEX_* state.
 while IFS='=' read -r name _; do
   case "$name" in
@@ -326,7 +362,7 @@ done < <(env)
 unset OPENAI_API_KEY
 
 review_cmd=(
-  codex
+  "$wrapped_codex_bin"
   --ask-for-approval never
   exec
   # Trusted self-hosted CI runners can hit bubblewrap/Landlock limitations on

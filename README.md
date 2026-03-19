@@ -113,6 +113,9 @@ jobs:
   verdict, counts, override state, and workflow links.
 - The review helper emits timestamped progress logs while Codex is running so
   long inference steps do not look frozen in Actions.
+- The review helper pins the runner's existing `codex` executable behind a
+  wrapper before isolating `HOME`, so common self-hosted installs such as
+  Volta-managed shims keep working during review execution.
 - Managed inline comments are replaced on reruns instead of accumulating.
 - The caller workflow must grant `actions: read` so the reusable workflow can
   resolve its own pinned source from the current run metadata.
