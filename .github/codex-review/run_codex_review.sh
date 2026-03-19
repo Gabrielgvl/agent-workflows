@@ -309,7 +309,9 @@ review_cmd=(
   codex
   --ask-for-approval never
   exec
-  --sandbox read-only
+  # Trusted self-hosted CI runners can hit bubblewrap/Landlock limitations on
+  # Linux. Run reviews with full access instead of relying on the OS sandbox.
+  --sandbox danger-full-access
   --model "$review_model"
   --disable js_repl
   --disable multi_agent

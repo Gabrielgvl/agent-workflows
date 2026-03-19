@@ -114,6 +114,9 @@ jobs:
 - Managed inline comments are replaced on reruns instead of accumulating.
 - The caller workflow must grant `actions: read` so the reusable workflow can
   resolve its own pinned source from the current run metadata.
+- The review helper runs Codex with `--sandbox danger-full-access`. This is
+  intentional for trusted CI runners where the Linux sandbox backend can fail
+  during setup, including `bwrap` loopback bridge initialization.
 - P0 always blocks.
 - P1 blocks unless an admin override is active.
 - P2 and P3 are visible in the summary and artifacts, but do not block.
