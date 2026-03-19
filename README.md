@@ -111,6 +111,8 @@ jobs:
 - Blocking findings are published as native inline PR review comments.
 - The workflow always maintains one sticky PR summary comment with the current
   verdict, counts, override state, and workflow links.
+- The review helper emits timestamped progress logs while Codex is running so
+  long inference steps do not look frozen in Actions.
 - Managed inline comments are replaced on reruns instead of accumulating.
 - The caller workflow must grant `actions: read` so the reusable workflow can
   resolve its own pinned source from the current run metadata.
@@ -156,6 +158,7 @@ Runner and installation inputs:
   `@openai/codex` version used when `install_codex_cli` is true
 - `review_timeout_seconds`
   Inner Codex execution timeout
+  Default: `600`
 - `override_label`
   Label used by the override workflow to mark an approved P1 exception
 

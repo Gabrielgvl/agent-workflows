@@ -10,7 +10,7 @@ diff_path="${CODEX_REVIEW_DIFF_PATH:-codex-review.diff}"
 changed_files_path="${CODEX_REVIEW_CHANGED_FILES_PATH:-codex-changed-files.txt}"
 review_base="${CODEX_REVIEW_BASE:-}"
 review_model="${CODEX_REVIEW_MODEL:-gpt-5.4}"
-review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-900}"
+review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-600}"
 review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-low}"
 review_reasoning_summary="${CODEX_REVIEW_REASONING_SUMMARY:-}"
 review_verbosity="${CODEX_REVIEW_VERBOSITY:-}"
@@ -18,6 +18,8 @@ auth_json="${CODEX_AUTH_JSON:-}"
 runner_temp_root="${RUNNER_TEMP:-$PWD/.tmp/codex-review}"
 timeout_bin=""
 stdbuf_bin=""
+heartbeat_seconds="${CODEX_REVIEW_HEARTBEAT_SECONDS:-30}"
+heartbeat_pid=""
 
 mkdir -p "$runner_temp_root"
 rm -f \
@@ -27,6 +29,14 @@ rm -f \
   "$prompt_path" \
   "$diff_path" \
   "$changed_files_path"
+
+timestamp_utc() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+log_info() {
+  printf '[%s] %s\n' "$(timestamp_utc)" "$*" | tee -a "$review_log_path"
+}
 
 require_command() {
   local name="$1"
@@ -102,6 +112,8 @@ fi
 
 git diff --name-status --find-renames "${review_base_ref}...HEAD" > "$changed_files_path"
 git diff --relative --find-renames --unified=5 "${review_base_ref}...HEAD" > "$diff_path"
+changed_file_count="$(wc -l < "$changed_files_path" | tr -d '[:space:]')"
+log_info "Prepared review context for ${changed_file_count} changed files against origin/${review_base}."
 
 cat > "$schema_path" <<'JSON'
 {
@@ -192,6 +204,8 @@ The repository root is the current working directory.
 Focus on actionable issues that affect correctness, performance, security, maintainability, or developer experience.
 Flag only issues introduced by this pull request.
 Do not report style nits, speculative concerns, or pre-existing issues.
+Prioritize the unified diff and changed files list first.
+Inspect unchanged files only when required to confirm a concrete issue, and read the smallest necessary context.
 Use the available tools to inspect the repository, changed files, and diff before deciding whether to raise a finding.
 
 Return JSON that matches the provided schema and nothing else.
@@ -218,6 +232,11 @@ codex_home_parent="$(mktemp -d "${runner_temp_root%/}/codex-home.XXXXXX")"
 codex_zdotdir="$(mktemp -d "${runner_temp_root%/}/codex-zdotdir.XXXXXX")"
 
 cleanup() {
+  if [[ -n "${heartbeat_pid:-}" ]]; then
+    kill "$heartbeat_pid" >/dev/null 2>&1 || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+    heartbeat_pid=""
+  fi
   rm -rf "$codex_home_parent" "$codex_zdotdir"
 }
 trap cleanup EXIT
@@ -294,6 +313,7 @@ if ! validate_auth_json "$codex_auth_path" > /dev/null 2>&1; then
   cat "$review_log_path"
   exit 2
 fi
+log_info "Restored isolated Codex auth bundle."
 
 # Keep the Codex subprocess isolated from runner-exported CODEX_* state.
 while IFS='=' read -r name _; do
@@ -337,14 +357,45 @@ if [[ -n "$stdbuf_bin" ]]; then
   review_cmd=("$stdbuf_bin" -oL -eL "${review_cmd[@]}")
 fi
 
+start_heartbeat() {
+  if ! [[ "$heartbeat_seconds" =~ ^[0-9]+$ ]] || [[ "$heartbeat_seconds" -lt 1 ]]; then
+    return
+  fi
+
+  local start_epoch="$1"
+  (
+    while true; do
+      sleep "$heartbeat_seconds"
+      now="$(date +%s)"
+      elapsed="$((now - start_epoch))"
+      printf '[%s] Codex review still running (%ss elapsed, %ss timeout).\n' \
+        "$(timestamp_utc)" "$elapsed" "$review_timeout_seconds" | tee -a "$review_log_path"
+    done
+  ) &
+  heartbeat_pid=$!
+}
+
+review_start_epoch="$(date +%s)"
+log_info "Starting Codex review with model=${review_model}, reasoning_effort=${review_reasoning_effort}, timeout=${review_timeout_seconds}s."
+
 set +e
+start_heartbeat "$review_start_epoch"
 "$timeout_bin" --signal=TERM --kill-after=30s "${review_timeout_seconds}s" \
-  "${review_cmd[@]}" < "$prompt_path" 2>&1 | tee "$review_log_path"
-rc=${PIPESTATUS[0]}
+  "${review_cmd[@]}" < "$prompt_path" > >(tee -a "$review_log_path") 2>&1
+rc=$?
+if [[ -n "${heartbeat_pid:-}" ]]; then
+  kill "$heartbeat_pid" >/dev/null 2>&1 || true
+  wait "$heartbeat_pid" 2>/dev/null || true
+  heartbeat_pid=""
+fi
 set -e
 
+review_elapsed_seconds="$(( $(date +%s) - review_start_epoch ))"
+log_info "Codex review command finished in ${review_elapsed_seconds}s with exit code ${rc}."
+
 if [[ "$rc" -eq 124 || "$rc" -eq 137 ]]; then
-  printf '\nERROR: codex exec timed out after %ss.\n' "$review_timeout_seconds" | tee -a "$review_log_path"
+  printf '\n[%s] ERROR: codex exec timed out after %ss.\n' \
+    "$(timestamp_utc)" "$review_timeout_seconds" | tee -a "$review_log_path"
 fi
 
 exit "$rc"

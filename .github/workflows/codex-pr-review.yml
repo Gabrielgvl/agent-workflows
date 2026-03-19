@@ -30,7 +30,7 @@ on:
       review_timeout_seconds:
         required: false
         type: string
-        default: "900"
+        default: "600"
       review_reasoning_effort:
         required: false
         type: string
