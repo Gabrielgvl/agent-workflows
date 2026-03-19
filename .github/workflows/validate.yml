@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile $(git ls-files '*.py')
+          git ls-files -z '*.py' | xargs -0r python3 -m py_compile
 
       - name: Run helper tests
         shell: bash

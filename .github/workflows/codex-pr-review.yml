@@ -288,15 +288,17 @@ jobs:
           python3 "${WORKFLOW_HELPERS_DIR}/collect_codex_review_state.py"
           # shellcheck disable=SC1091
           source codex-review-state.env
-          echo "p0_count=$p0_count" >> "$GITHUB_OUTPUT"
-          echo "p1_count=$p1_count" >> "$GITHUB_OUTPUT"
-          echo "p2_count=$p2_count" >> "$GITHUB_OUTPUT"
-          echo "p3_count=$p3_count" >> "$GITHUB_OUTPUT"
-          echo "parse_failed=$parse_failed" >> "$GITHUB_OUTPUT"
-          echo "findings_total=$findings_total" >> "$GITHUB_OUTPUT"
-          echo "selected_inline_count=$selected_inline_count" >> "$GITHUB_OUTPUT"
-          echo "unplaced_inline_count=$unplaced_inline_count" >> "$GITHUB_OUTPUT"
-          echo "truncated_inline_count=$truncated_inline_count" >> "$GITHUB_OUTPUT"
+          {
+            echo "p0_count=$p0_count"
+            echo "p1_count=$p1_count"
+            echo "p2_count=$p2_count"
+            echo "p3_count=$p3_count"
+            echo "parse_failed=$parse_failed"
+            echo "findings_total=$findings_total"
+            echo "selected_inline_count=$selected_inline_count"
+            echo "unplaced_inline_count=$unplaced_inline_count"
+            echo "truncated_inline_count=$truncated_inline_count"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Resolve admin override state
         id: override
