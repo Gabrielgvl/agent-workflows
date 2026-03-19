@@ -52,7 +52,7 @@ on:
         type: string
         default: codex-override-approved
     secrets:
-      codex_auth_json_b64:
+      codex_auth_json:
         required: true
 
 permissions:
@@ -80,7 +80,7 @@ jobs:
           REVIEW_REASONING_SUMMARY: ${{ inputs.review_reasoning_summary }}
           REVIEW_VERBOSITY: ${{ inputs.review_verbosity }}
           MAX_INLINE_COMMENTS: ${{ inputs.max_inline_comments }}
-          CODEX_AUTH_JSON_B64: ${{ secrets.codex_auth_json_b64 }}
+          CODEX_AUTH_JSON: ${{ secrets.codex_auth_json }}
         run: |
           set -euo pipefail
 
@@ -134,8 +134,8 @@ jobs:
           require_optional_choice "$REVIEW_REASONING_SUMMARY" "review_reasoning_summary" auto concise detailed none
           require_optional_choice "$REVIEW_VERBOSITY" "review_verbosity" low medium high
 
-          if [[ -z "${CODEX_AUTH_JSON_B64:-}" ]]; then
-            echo "::error::codex_auth_json_b64 is required."
+          if [[ -z "${CODEX_AUTH_JSON:-}" ]]; then
+            echo "::error::codex_auth_json is required."
             exit 1
           fi
 
@@ -246,7 +246,7 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
         env:
           WORKFLOW_HELPERS_DIR: ${{ github.workspace }}/_workflow-source/.github/codex-review
-          CODEX_AUTH_JSON_B64: ${{ secrets.codex_auth_json_b64 }}
+          CODEX_AUTH_JSON: ${{ secrets.codex_auth_json }}
           CODEX_REVIEW_RAW_OUTPUT_PATH: codex-review.json
           CODEX_REVIEW_LOG_PATH: codex-review.log
           CODEX_REVIEW_SCHEMA_PATH: codex-review.schema.json
