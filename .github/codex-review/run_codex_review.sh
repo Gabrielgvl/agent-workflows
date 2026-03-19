@@ -9,6 +9,7 @@ prompt_path="${CODEX_REVIEW_PROMPT_PATH:-codex-review.prompt.md}"
 diff_path="${CODEX_REVIEW_DIFF_PATH:-codex-review.diff}"
 changed_files_path="${CODEX_REVIEW_CHANGED_FILES_PATH:-codex-changed-files.txt}"
 review_base="${CODEX_REVIEW_BASE:-}"
+repository_owner="${CODEX_REVIEW_REPOSITORY_OWNER:-}"
 review_model="${CODEX_REVIEW_MODEL:-gpt-5.4}"
 review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-600}"
 review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-low}"
@@ -237,6 +238,14 @@ Context:
 - Changed files list: $(basename "$changed_files_path")
 - Unified diff: $(basename "$diff_path")
 EOF
+
+if [[ -n "$repository_owner" ]]; then
+  cat >> "$prompt_path" <<EOF
+- Treat GitHub Actions reusable workflows and actions from repositories owned by ${repository_owner} as first-party trusted infrastructure for this repository.
+- Do not raise findings solely because those same-owner workflow or action references use a major version tag such as \`@v1\`.
+- Still raise findings for mutable refs from external owners, or for same-owner workflow changes that expand permissions, secrets exposure, or other concrete risk.
+EOF
+fi
 
 codex_home_parent="$(mktemp -d "${runner_temp_root%/}/codex-home.XXXXXX")"
 codex_zdotdir="$(mktemp -d "${runner_temp_root%/}/codex-zdotdir.XXXXXX")"

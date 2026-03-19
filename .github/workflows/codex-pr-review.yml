@@ -254,6 +254,7 @@ jobs:
           CODEX_REVIEW_DIFF_PATH: codex-review.diff
           CODEX_REVIEW_CHANGED_FILES_PATH: codex-changed-files.txt
           CODEX_REVIEW_BASE: ${{ github.base_ref }}
+          CODEX_REVIEW_REPOSITORY_OWNER: ${{ github.repository_owner }}
           CODEX_REVIEW_MODEL: ${{ inputs.review_model }}
           CODEX_REVIEW_TIMEOUT_SECONDS: ${{ inputs.review_timeout_seconds }}
           CODEX_REVIEW_REASONING_EFFORT: ${{ inputs.review_reasoning_effort }}
