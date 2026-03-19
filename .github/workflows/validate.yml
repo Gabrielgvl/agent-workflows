@@ -32,6 +32,12 @@ jobs:
             bash -n "$script_path"
           done < <(find . -type f -name '*.sh' | sort)
 
+      - name: Validate executable entrypoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x .github/codex-review/run_codex_review.sh
+
       - name: Validate Python syntax
         shell: bash
         run: |

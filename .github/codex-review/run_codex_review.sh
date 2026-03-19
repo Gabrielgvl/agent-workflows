@@ -14,7 +14,7 @@ review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-900}"
 review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-low}"
 review_reasoning_summary="${CODEX_REVIEW_REASONING_SUMMARY:-}"
 review_verbosity="${CODEX_REVIEW_VERBOSITY:-}"
-openai_api_key="${OPENAI_API_KEY:-}"
+auth_json_b64="${CODEX_AUTH_JSON_B64:-}"
 runner_temp_root="${RUNNER_TEMP:-$PWD/.tmp/codex-review}"
 timeout_bin=""
 stdbuf_bin=""
@@ -76,8 +76,8 @@ if [[ -z "$review_base" ]]; then
   exit 2
 fi
 
-if [[ -z "$openai_api_key" ]]; then
-  printf 'ERROR: OPENAI_API_KEY is required.\n' > "$review_log_path"
+if [[ -z "$auth_json_b64" ]]; then
+  printf 'ERROR: CODEX_AUTH_JSON_B64 is required.\n' > "$review_log_path"
   cat "$review_log_path"
   exit 2
 fi
@@ -240,14 +240,78 @@ export XDG_CACHE_HOME="$codex_home_parent/.cache"
 export XDG_STATE_HOME="$codex_home_parent/.local/state"
 export ZDOTDIR="$codex_zdotdir"
 
-printf '%s' "$openai_api_key" | codex login --with-api-key >/dev/null
+codex_auth_path="$codex_home_parent/.codex/auth.json"
+
+validate_auth_json() {
+  python3 - "$1" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+
+if not isinstance(data, dict):
+    raise SystemExit("auth.json must be a JSON object.")
+
+auth_mode = data.get("auth_mode")
+if not isinstance(auth_mode, str) or not auth_mode.strip():
+    raise SystemExit("auth.json is missing auth_mode.")
+
+tokens = data.get("tokens")
+if not isinstance(tokens, dict):
+    raise SystemExit("auth.json is missing tokens.")
+
+for key in ("access_token", "id_token", "refresh_token"):
+    value = tokens.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise SystemExit(f"auth.json is missing tokens.{key}.")
+PY
+}
+
+if ! AUTH_JSON_B64="$auth_json_b64" python3 - "$codex_auth_path" <<'PY'
+import base64
+import os
+import pathlib
+import sys
+
+payload = os.environ.get("AUTH_JSON_B64", "").strip()
+if not payload:
+    raise SystemExit("CODEX_AUTH_JSON_B64 is empty.")
+
+decoded = base64.b64decode(payload.encode("utf-8"), validate=True)
+path = pathlib.Path(sys.argv[1])
+path.write_bytes(decoded)
+PY
+then
+  printf 'ERROR: failed to decode CODEX_AUTH_JSON_B64 into auth.json.\n' > "$review_log_path"
+  cat "$review_log_path"
+  exit 2
+fi
+
+chmod 600 "$codex_auth_path"
+if ! validate_auth_json "$codex_auth_path" > /dev/null 2>&1; then
+  printf 'ERROR: restored auth.json failed validation.\n' > "$review_log_path"
+  validate_auth_json "$codex_auth_path" >> "$review_log_path" 2>&1 || true
+  cat "$review_log_path"
+  exit 2
+fi
+
+# Keep the Codex subprocess isolated from runner-exported CODEX_* state.
+while IFS='=' read -r name _; do
+  case "$name" in
+    CODEX_*)
+      unset "$name"
+      ;;
+  esac
+done < <(env)
 unset OPENAI_API_KEY
 
 review_cmd=(
   codex
+  --ask-for-approval never
   exec
   --sandbox read-only
-  --ask-for-approval never
   --model "$review_model"
   --disable js_repl
   --disable multi_agent
@@ -275,7 +339,7 @@ fi
 
 set +e
 "$timeout_bin" --signal=TERM --kill-after=30s "${review_timeout_seconds}s" \
-  env -u OPENAI_API_KEY "${review_cmd[@]}" < "$prompt_path" 2>&1 | tee "$review_log_path"
+  "${review_cmd[@]}" < "$prompt_path" 2>&1 | tee "$review_log_path"
 rc=${PIPESTATUS[0]}
 set -e
 

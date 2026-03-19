@@ -19,17 +19,18 @@ other agent tools without changing the repository identity.
 
 ## Auth contract
 
-The first shared review workflow supports explicit API-key login in v1.
+The shared review workflow restores a Codex CLI auth bundle from
+`codex_auth_json_b64`.
 
-The workflow requires the caller to pass an API key secret. The helper scripts
-log in inside an isolated temporary Codex home, then unset `OPENAI_API_KEY`
-before the actual review run.
+The helper scripts decode the secret into an isolated `~/.codex/auth.json`,
+validate the restored bundle shape, and run the review without relying on
+runner-local Codex state. This keeps the workflow aligned with the current
+Orbio CI contract: restored Codex session credentials in a temporary isolated
+home, not API-key login during the job.
 
-OpenAI's current guidance recommends API keys as the default auth path for CI
-automation, and treats persisted `auth.json` as an advanced pattern for trusted
-private runners only:
+OpenAI documents persisted `auth.json` as an advanced pattern for trusted
+private runners:
 
-- https://developers.openai.com/codex/noninteractive/#use-api-key-auth-recommended
 - https://developers.openai.com/codex/auth/ci-cd-auth/
 - https://developers.openai.com/codex/cli/reference/#codex-login
 
@@ -74,7 +75,7 @@ jobs:
       review_reasoning_effort: low
       max_inline_comments: "10"
     secrets:
-      openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+      codex_auth_json_b64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
 ```
 
 Example override caller:
@@ -148,6 +149,12 @@ Runner and installation inputs:
   Inner Codex execution timeout
 - `override_label`
   Label used by the override workflow to mark an approved P1 exception
+
+Secrets:
+
+- `codex_auth_json_b64`
+  Required. Base64-encoded Codex CLI `auth.json` restored into an isolated
+  temporary home for the review run.
 
 ## Release guidance
 

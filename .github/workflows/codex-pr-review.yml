@@ -52,7 +52,7 @@ on:
         type: string
         default: codex-override-approved
     secrets:
-      openai_api_key:
+      codex_auth_json_b64:
         required: true
 
 permissions:
@@ -79,6 +79,7 @@ jobs:
           REVIEW_REASONING_SUMMARY: ${{ inputs.review_reasoning_summary }}
           REVIEW_VERBOSITY: ${{ inputs.review_verbosity }}
           MAX_INLINE_COMMENTS: ${{ inputs.max_inline_comments }}
+          CODEX_AUTH_JSON_B64: ${{ secrets.codex_auth_json_b64 }}
         run: |
           set -euo pipefail
 
@@ -131,6 +132,11 @@ jobs:
           require_choice "$REVIEW_REASONING_EFFORT" "review_reasoning_effort" minimal low medium high xhigh
           require_optional_choice "$REVIEW_REASONING_SUMMARY" "review_reasoning_summary" auto concise detailed none
           require_optional_choice "$REVIEW_VERBOSITY" "review_verbosity" low medium high
+
+          if [[ -z "${CODEX_AUTH_JSON_B64:-}" ]]; then
+            echo "::error::codex_auth_json_b64 is required."
+            exit 1
+          fi
 
       - name: Resolve workflow source
         id: workflow_source
@@ -215,7 +221,7 @@ jobs:
         working-directory: ${{ inputs.working_directory }}
         env:
           WORKFLOW_HELPERS_DIR: ${{ github.workspace }}/_workflow-source/.github/codex-review
-          OPENAI_API_KEY: ${{ secrets.openai_api_key }}
+          CODEX_AUTH_JSON_B64: ${{ secrets.codex_auth_json_b64 }}
           CODEX_REVIEW_RAW_OUTPUT_PATH: codex-review.json
           CODEX_REVIEW_LOG_PATH: codex-review.log
           CODEX_REVIEW_SCHEMA_PATH: codex-review.schema.json
