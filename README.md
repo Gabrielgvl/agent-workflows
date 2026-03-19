@@ -116,6 +116,9 @@ jobs:
 - The review helper pins the runner's existing `codex` executable behind a
   wrapper before isolating `HOME`, so common self-hosted installs such as
   Volta-managed shims keep working during review execution.
+- The review prompt treats same-owner reusable workflows and actions as
+  first-party infrastructure, so it does not raise supply-chain findings solely
+  because those refs use a major tag such as `@v1`.
 - Managed inline comments are replaced on reruns instead of accumulating.
 - The caller workflow must grant `actions: read` so the reusable workflow can
   resolve its own pinned source from the current run metadata.
