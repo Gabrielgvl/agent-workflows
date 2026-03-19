@@ -384,6 +384,7 @@ def plan_thread_actions(
     new_inline_candidates: list[dict[str, Any]] = []
     reopened_thread_ids: list[str] = []
     still_open_count = 0
+    new_findings_count = 0
 
     for finding in findings:
         planned_finding = dict(finding)
@@ -434,6 +435,7 @@ def plan_thread_actions(
                 still_open_count += 1
         else:
             new_inline_candidates.append(planned_finding)
+            new_findings_count += 1
 
         planned_findings.append(planned_finding)
 
@@ -470,7 +472,7 @@ def plan_thread_actions(
         "unplaced_inline_count": unplaced_inline_count,
         "truncated_inline_count": truncated_inline_count,
         "thread_lifecycle_counts": {
-            "new": len(created_inline_findings),
+            "new": new_findings_count,
             "still_open": still_open_count,
             "reopened": len(reopened_thread_ids),
             "resolved": len(resolve_thread_ids),
@@ -676,7 +678,7 @@ def render_summary_body(
             f"unplaced `{unplaced_inline_count}` | truncated `{truncated_inline_count}`"
         ),
         (
-            "Thread lifecycle: "
+            "Finding lifecycle: "
             f"new `{(thread_lifecycle_counts or {}).get('new', 0)}` | "
             f"still open `{(thread_lifecycle_counts or {}).get('still_open', 0)}` | "
             f"reopened `{(thread_lifecycle_counts or {}).get('reopened', 0)}` | "

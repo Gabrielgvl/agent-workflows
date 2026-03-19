@@ -240,7 +240,7 @@ class SummaryRenderingTests(unittest.TestCase):
         self.assertIn("Result: **blocking**", body)
         self.assertIn("Model: `gpt-5.4`", body)
         self.assertIn("`src/app.py:12`", body)
-        self.assertIn("Thread lifecycle: new `1`", body)
+        self.assertIn("Finding lifecycle: new `1`", body)
 
 
 class ThreadActionPlanningTests(unittest.TestCase):
