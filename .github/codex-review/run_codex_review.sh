@@ -8,6 +8,7 @@ schema_path="${CODEX_REVIEW_SCHEMA_PATH:-codex-review.schema.json}"
 prompt_path="${CODEX_REVIEW_PROMPT_PATH:-codex-review.prompt.md}"
 diff_path="${CODEX_REVIEW_DIFF_PATH:-codex-review.diff}"
 changed_files_path="${CODEX_REVIEW_CHANGED_FILES_PATH:-codex-changed-files.txt}"
+prior_open_findings_path="${CODEX_REVIEW_PRIOR_OPEN_FINDINGS_PATH:-codex-review-prior-open-findings.json}"
 review_base="${CODEX_REVIEW_BASE:-}"
 repository_owner="${CODEX_REVIEW_REPOSITORY_OWNER:-}"
 review_model="${CODEX_REVIEW_MODEL:-gpt-5.4}"
@@ -165,6 +166,10 @@ cat > "$schema_path" <<'JSON'
           "end_line": {
             "type": "integer",
             "minimum": 1
+          },
+          "previous_fingerprint": {
+            "type": "string",
+            "minLength": 1
           }
         },
         "required": [
@@ -227,6 +232,9 @@ Output requirements:
 - Set \`priority\` to 0 for the most severe blocking issues and 3 for the least severe findings.
 - Keep \`title\` short and direct.
 - Make \`body\` concise, specific, and actionable.
+- When a currently valid finding matches a previously open finding, copy its \`previous_fingerprint\` exactly into the result.
+- After revalidating any previously open findings, continue looking for additional new issues.
+- Return only findings that are still valid on the current HEAD. Omit previously open findings that are now resolved.
 - If there are no actionable findings, return an empty \`findings\` array.
 - Use \`overall_correctness\` of \`patch is correct\` only when the patch is safe to merge as-is.
 
@@ -245,6 +253,70 @@ if [[ -n "$repository_owner" ]]; then
 - Do not raise findings solely because those same-owner workflow or action references use a major version tag such as \`@v1\`.
 - Still raise findings for mutable refs from external owners, or for same-owner workflow changes that expand permissions, secrets exposure, or other concrete risk.
 EOF
+fi
+
+prior_open_findings_count=0
+if [[ -f "$prior_open_findings_path" ]]; then
+  prior_open_findings_count="$(python3 - "$prior_open_findings_path" "$prompt_path" <<'PY'
+import json
+import pathlib
+import sys
+
+prior_path = pathlib.Path(sys.argv[1])
+prompt_path = pathlib.Path(sys.argv[2])
+payload = json.loads(prior_path.read_text(encoding="utf-8"))
+findings = payload.get("open_findings")
+if not isinstance(findings, list):
+    raise SystemExit("open_findings payload must include an open_findings array.")
+
+if not findings:
+    print("0")
+    raise SystemExit(0)
+
+lines = [
+    "",
+    "Revalidate these currently open Codex findings before looking for new issues:",
+]
+for finding in findings:
+    previous_fingerprint = str(finding.get("previous_fingerprint") or "").strip()
+    title = str(finding.get("title") or "").strip()
+    body = str(finding.get("body") or "").strip()
+    path = str(finding.get("path") or "").strip()
+    start_line = finding.get("start_line")
+    end_line = finding.get("end_line")
+    priority_label = str(finding.get("priority_label") or "").strip()
+    if (
+        not previous_fingerprint
+        or not title
+        or not body
+        or not path
+        or not priority_label
+        or not isinstance(start_line, int)
+        or not isinstance(end_line, int)
+    ):
+        raise SystemExit("Each open prior finding must include previous_fingerprint, title, body, path, start_line, end_line, and priority_label.")
+    location = (
+        f"{path}:{start_line}"
+        if start_line == end_line
+        else f"{path}:{start_line}-{end_line}"
+    )
+    lines.extend(
+        [
+            "",
+            f"- previous_fingerprint: {previous_fingerprint}",
+            f"  priority: {priority_label}",
+            f"  location: {location}",
+            f"  title: {title}",
+            f"  body: {body}",
+        ]
+    )
+
+with prompt_path.open("a", encoding="utf-8") as handle:
+    handle.write("\n".join(lines) + "\n")
+
+print(str(len(findings)))
+PY
+)"
 fi
 
 codex_home_parent="$(mktemp -d "${runner_temp_root%/}/codex-home.XXXXXX")"
@@ -421,7 +493,7 @@ start_heartbeat() {
 }
 
 review_start_epoch="$(date +%s)"
-log_info "Starting Codex review with model=${review_model}, reasoning_effort=${review_reasoning_effort}, timeout=${review_timeout_seconds}s."
+log_info "Starting Codex review with model=${review_model}, reasoning_effort=${review_reasoning_effort}, timeout=${review_timeout_seconds}s, prior_open_findings=${prior_open_findings_count}."
 
 set +e
 start_heartbeat "$review_start_epoch"

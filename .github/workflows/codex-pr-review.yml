@@ -240,6 +240,20 @@ jobs:
           git fetch --no-tags origin \
             "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
 
+      - name: Collect prior managed review threads
+        shell: bash
+        working-directory: ${{ inputs.working_directory }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/_workflow-source/.github/codex-review
+          WORKFLOW_HELPERS_DIR: ${{ github.workspace }}/_workflow-source/.github/codex-review
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_PULL_NUMBER: ${{ github.event.pull_request.number }}
+          CODEX_REVIEW_PRIOR_THREADS_PATH: codex-review-prior-threads.json
+          CODEX_REVIEW_PRIOR_OPEN_FINDINGS_PATH: codex-review-prior-open-findings.json
+        run: |
+          set -euo pipefail
+          python3 "${WORKFLOW_HELPERS_DIR}/fetch_prior_review_threads.py"
+
       - name: Run structured Codex review
         id: review
         shell: bash
@@ -253,6 +267,7 @@ jobs:
           CODEX_REVIEW_PROMPT_PATH: codex-review.prompt.md
           CODEX_REVIEW_DIFF_PATH: codex-review.diff
           CODEX_REVIEW_CHANGED_FILES_PATH: codex-changed-files.txt
+          CODEX_REVIEW_PRIOR_OPEN_FINDINGS_PATH: codex-review-prior-open-findings.json
           CODEX_REVIEW_BASE: ${{ github.base_ref }}
           CODEX_REVIEW_REPOSITORY_OWNER: ${{ github.repository_owner }}
           CODEX_REVIEW_MODEL: ${{ inputs.review_model }}
@@ -392,6 +407,8 @@ jobs:
             ${{ inputs.working_directory }}/codex-review.prompt.md
             ${{ inputs.working_directory }}/codex-review.diff
             ${{ inputs.working_directory }}/codex-changed-files.txt
+            ${{ inputs.working_directory }}/codex-review-prior-threads.json
+            ${{ inputs.working_directory }}/codex-review-prior-open-findings.json
             ${{ inputs.working_directory }}/codex-review-state.json
             ${{ inputs.working_directory }}/codex-review-state.env
           if-no-files-found: ignore
@@ -410,6 +427,7 @@ jobs:
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GITHUB_ARTIFACT_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}#artifacts
           CODEX_REVIEW_STATE_PATH: codex-review-state.json
+          CODEX_REVIEW_PRIOR_THREADS_PATH: codex-review-prior-threads.json
           OVERRIDE_ACTIVE: ${{ steps.override.outputs.active }}
           OVERRIDE_STALE: ${{ steps.override.outputs.stale }}
           OVERRIDE_APPROVED_BY: ${{ steps.override.outputs.approved_by }}
