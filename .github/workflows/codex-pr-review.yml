@@ -6,7 +6,7 @@ on:
       runs_on_json:
         required: false
         type: string
-        default: '["ubuntu-latest"]'
+        default: '["self-hosted"]'
       working_directory:
         required: false
         type: string

@@ -40,6 +40,9 @@ Each consumer repository keeps a thin caller workflow with repo-local triggers,
 permissions, and concurrency. The caller delegates the implementation to this
 repository by semver tag or immutable ref.
 
+Because this workflow restores a Codex CLI auth bundle, callers should run it on
+trusted private runners, not on public shared runner fleets.
+
 Example PR review caller:
 
 ```yaml
@@ -68,7 +71,7 @@ jobs:
   review:
     uses: Gabrielgvl/agent-workflows/.github/workflows/codex-pr-review.yml@v1
     with:
-      runs_on_json: '["ubuntu-latest"]'
+      runs_on_json: '["self-hosted"]'
       install_codex_cli: true
       codex_version: "0.115.0"
       review_model: "gpt-5.4"
