@@ -56,6 +56,7 @@ on:
         required: true
 
 permissions:
+  actions: read
   contents: read
   issues: write
   pull-requests: write
@@ -140,22 +141,46 @@ jobs:
 
       - name: Resolve workflow source
         id: workflow_source
-        shell: bash
-        env:
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-        run: |
-          set -euo pipefail
-          workflow_ref="${WORKFLOW_REF:?github.workflow_ref was not set}"
-          repository="${workflow_ref%%/.github/workflows/*}"
-          ref="${workflow_ref#*@}"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runId = Number(process.env.GITHUB_RUN_ID || "0");
 
-          if [[ "$repository" == "$workflow_ref" || "$ref" == "$workflow_ref" || -z "$repository" || -z "$ref" ]]; then
-            echo "::error::Unable to resolve workflow source from github.workflow_ref=${workflow_ref}"
-            exit 1
-          fi
+            if (!Number.isInteger(runId) || runId <= 0) {
+              core.setFailed(`Invalid GITHUB_RUN_ID: ${process.env.GITHUB_RUN_ID || ""}`);
+              return;
+            }
 
-          echo "repository=$repository" >> "$GITHUB_OUTPUT"
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+            const response = await github.request("GET /repos/{owner}/{repo}/actions/runs/{run_id}", {
+              owner,
+              repo,
+              run_id: runId,
+            });
+            const referencedWorkflows = response.data.referenced_workflows || [];
+            const workflowPathSuffix = "/.github/workflows/codex-pr-review.yml@";
+            const reusableWorkflow = referencedWorkflows.find((workflow) =>
+              workflow.path?.includes(workflowPathSuffix),
+            );
+
+            if (!reusableWorkflow) {
+              core.setFailed(
+                `Unable to resolve the reusable workflow from referenced_workflows=${JSON.stringify(referencedWorkflows)}`,
+              );
+              return;
+            }
+
+            const workflowRef = reusableWorkflow.path;
+            const repository = workflowRef.split("/.github/workflows/")[0];
+            const ref = reusableWorkflow.sha || workflowRef.split("@")[1] || "";
+
+            if (!repository || !ref) {
+              core.setFailed(`Unable to parse reusable workflow source from ${workflowRef}`);
+              return;
+            }
+
+            core.setOutput("repository", repository);
+            core.setOutput("ref", ref);
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -263,15 +288,17 @@ jobs:
           python3 "${WORKFLOW_HELPERS_DIR}/collect_codex_review_state.py"
           # shellcheck disable=SC1091
           source codex-review-state.env
-          echo "p0_count=$p0_count" >> "$GITHUB_OUTPUT"
-          echo "p1_count=$p1_count" >> "$GITHUB_OUTPUT"
-          echo "p2_count=$p2_count" >> "$GITHUB_OUTPUT"
-          echo "p3_count=$p3_count" >> "$GITHUB_OUTPUT"
-          echo "parse_failed=$parse_failed" >> "$GITHUB_OUTPUT"
-          echo "findings_total=$findings_total" >> "$GITHUB_OUTPUT"
-          echo "selected_inline_count=$selected_inline_count" >> "$GITHUB_OUTPUT"
-          echo "unplaced_inline_count=$unplaced_inline_count" >> "$GITHUB_OUTPUT"
-          echo "truncated_inline_count=$truncated_inline_count" >> "$GITHUB_OUTPUT"
+          {
+            echo "p0_count=$p0_count"
+            echo "p1_count=$p1_count"
+            echo "p2_count=$p2_count"
+            echo "p3_count=$p3_count"
+            echo "parse_failed=$parse_failed"
+            echo "findings_total=$findings_total"
+            echo "selected_inline_count=$selected_inline_count"
+            echo "unplaced_inline_count=$unplaced_inline_count"
+            echo "truncated_inline_count=$truncated_inline_count"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Resolve admin override state
         id: override

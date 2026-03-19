@@ -63,6 +63,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
   issues: write
   pull-requests: write
@@ -111,6 +112,8 @@ jobs:
 - The workflow always maintains one sticky PR summary comment with the current
   verdict, counts, override state, and workflow links.
 - Managed inline comments are replaced on reruns instead of accumulating.
+- The caller workflow must grant `actions: read` so the reusable workflow can
+  resolve its own pinned source from the current run metadata.
 - P0 always blocks.
 - P1 blocks unless an admin override is active.
 - P2 and P3 are visible in the summary and artifacts, but do not block.

@@ -22,7 +22,7 @@ jobs:
           python-version: "3.12"
 
       - name: Lint workflows
-        uses: rhysd/actionlint@v1
+        uses: rhysd/actionlint@v1.7.11
 
       - name: Validate shell scripts
         shell: bash
@@ -42,7 +42,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -m py_compile $(git ls-files '*.py')
+          git ls-files -z '*.py' | xargs -0r python3 -m py_compile
 
       - name: Run helper tests
         shell: bash
