@@ -13,6 +13,15 @@ INLINE_MARKER_PREFIX = "<!-- codex-pr-review-inline:"
 INLINE_MARKER_SUFFIX = " -->"
 PRIORITY_LABELS = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+INLINE_MARKER_RE = re.compile(r"<!-- codex-pr-review-inline:([0-9a-f]{16}) -->")
+INLINE_COMMENT_RE = re.compile(
+    r"^\*\*\[(P[0-3])\] (?P<title>.+?)\*\*\n\n"
+    r"`(?P<location>[^`]+)`\n\n"
+    r"(?P<body>.*?)\n\n"
+    r"Confidence: (?P<confidence>[^\n]+)\n\n"
+    r"<!-- codex-pr-review-inline:(?P<fingerprint>[0-9a-f]{16}) -->\s*$",
+    re.DOTALL,
+)
 
 
 def _coerce_int(value: Any, *, field_name: str) -> int:
@@ -45,6 +54,69 @@ def _coerce_text(value: Any, *, field_name: str) -> str:
     if not text:
         raise ValueError(f"{field_name} must not be empty.")
     return text
+
+
+def _parse_priority_label(value: Any, *, field_name: str) -> tuple[int, str]:
+    label = _coerce_text(value, field_name=field_name)
+    reverse_map = {label: priority for priority, label in PRIORITY_LABELS.items()}
+    if label not in reverse_map:
+        raise ValueError(f"{field_name} must be one of: {', '.join(reverse_map)}.")
+    return reverse_map[label], label
+
+
+def _compute_fingerprint(
+    *,
+    priority: int,
+    title: str,
+    body: str,
+    path: str,
+    start_line: int,
+    end_line: int,
+) -> str:
+    fingerprint_source = json.dumps(
+        {
+            "priority": priority,
+            "title": title,
+            "body": body,
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_location(location_text: str) -> tuple[str, int, int]:
+    location = _coerce_text(location_text, field_name="finding.location")
+    if ":" not in location:
+        raise ValueError("finding.location must include a file path and line number.")
+    path_text, line_text = location.rsplit(":", 1)
+    path = normalize_repo_path(path_text)
+
+    if "-" in line_text:
+        start_text, end_text = line_text.split("-", 1)
+        start_line = _coerce_int(start_text, field_name="finding.start_line")
+        end_line = _coerce_int(end_text, field_name="finding.end_line")
+    else:
+        start_line = _coerce_int(line_text, field_name="finding.start_line")
+        end_line = start_line
+
+    if start_line < 1 or end_line < 1:
+        raise ValueError("finding line numbers must be >= 1.")
+    if end_line < start_line:
+        raise ValueError("finding.end_line must be >= start_line.")
+    return path, start_line, end_line
+
+
+def _finding_signature(finding: dict[str, Any]) -> tuple[int, str, int, int, str]:
+    return (
+        int(finding["priority"]),
+        str(finding["path"]),
+        int(finding["start_line"]),
+        int(finding["end_line"]),
+        str(finding["title"]).strip().lower(),
+    )
 
 
 def normalize_repo_path(raw_path: Any) -> str:
@@ -129,6 +201,7 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
 
     normalized_findings: list[dict[str, Any]] = []
     seen_fingerprints: set[str] = set()
+    seen_previous_fingerprints: set[str] = set()
 
     for index, raw_finding in enumerate(findings):
         if not isinstance(raw_finding, dict):
@@ -153,18 +226,25 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
         if end_line < start_line:
             raise ValueError(f"finding[{index}].end_line must be >= start_line.")
 
-        fingerprint_source = json.dumps(
-            {
-                "priority": priority,
-                "title": title,
-                "body": body,
-                "path": path,
-                "start_line": start_line,
-                "end_line": end_line,
-            },
-            sort_keys=True,
+        fingerprint = _compute_fingerprint(
+            priority=priority,
+            title=title,
+            body=body,
+            path=path,
+            start_line=start_line,
+            end_line=end_line,
         )
-        fingerprint = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()[:16]
+
+        previous_fingerprint = raw_finding.get("previous_fingerprint")
+        if previous_fingerprint is not None:
+            previous_fingerprint = _coerce_text(
+                previous_fingerprint,
+                field_name=f"finding[{index}].previous_fingerprint",
+            )
+            if previous_fingerprint in seen_previous_fingerprints:
+                continue
+            seen_previous_fingerprints.add(previous_fingerprint)
+
         if fingerprint in seen_fingerprints:
             continue
         seen_fingerprints.add(fingerprint)
@@ -180,6 +260,7 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
                 "end_line": end_line,
                 "confidence_score": round(confidence_score, 4),
                 "fingerprint": fingerprint,
+                "previous_fingerprint": previous_fingerprint,
             }
         )
 
@@ -199,6 +280,201 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
         "overall_explanation": overall_explanation,
         "overall_confidence_score": round(overall_confidence_score, 4),
         "findings": normalized_findings,
+    }
+
+
+def extract_inline_fingerprint(comment_body: str) -> str | None:
+    match = INLINE_MARKER_RE.search(comment_body)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def parse_managed_inline_comment(comment_body: str) -> dict[str, Any]:
+    if not isinstance(comment_body, str):
+        raise ValueError("Managed inline comment body must be a string.")
+
+    match = INLINE_COMMENT_RE.match(comment_body.strip())
+    if not match:
+        raise ValueError("Managed inline comment body does not match the expected format.")
+
+    priority, priority_label = _parse_priority_label(
+        match.group(1),
+        field_name="finding.priority_label",
+    )
+    path, start_line, end_line = _parse_location(match.group("location"))
+    title = _coerce_text(match.group("title"), field_name="finding.title")
+    body = _coerce_text(match.group("body"), field_name="finding.body")
+    confidence_score = _coerce_float(
+        match.group("confidence"),
+        field_name="finding.confidence_score",
+    )
+    if not 0 <= confidence_score <= 1:
+        raise ValueError("finding.confidence_score must be between 0 and 1.")
+
+    fingerprint = _coerce_text(
+        match.group("fingerprint"),
+        field_name="finding.fingerprint",
+    )
+
+    return {
+        "priority": priority,
+        "priority_label": priority_label,
+        "title": title,
+        "body": body,
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "confidence_score": round(confidence_score, 4),
+        "fingerprint": fingerprint,
+    }
+
+
+def build_open_prior_findings(managed_threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    open_findings: list[dict[str, Any]] = []
+    for thread in managed_threads:
+        if thread.get("is_resolved"):
+            continue
+        finding = thread.get("finding")
+        if not isinstance(finding, dict):
+            continue
+        open_findings.append(
+            {
+                "previous_fingerprint": thread["fingerprint"],
+                "priority": finding["priority"],
+                "priority_label": finding["priority_label"],
+                "title": finding["title"],
+                "body": finding["body"],
+                "path": finding["path"],
+                "start_line": finding["start_line"],
+                "end_line": finding["end_line"],
+                "confidence_score": finding["confidence_score"],
+            }
+        )
+    return open_findings
+
+
+def plan_thread_actions(
+    findings: list[dict[str, Any]],
+    *,
+    managed_threads: list[dict[str, Any]],
+    max_inline_comments: int,
+) -> dict[str, Any]:
+    unresolved_by_fingerprint: dict[str, dict[str, Any]] = {}
+    all_by_fingerprint: dict[str, dict[str, Any]] = {}
+    unresolved_by_signature: dict[tuple[int, str, int, int, str], dict[str, Any]] = {}
+    all_by_signature: dict[tuple[int, str, int, int, str], dict[str, Any]] = {}
+
+    for thread in managed_threads:
+        fingerprint = thread.get("fingerprint")
+        if not isinstance(fingerprint, str) or not fingerprint:
+            continue
+        thread_finding = thread.get("finding")
+        if not isinstance(thread_finding, dict):
+            continue
+        signature = _finding_signature(thread_finding)
+        all_by_fingerprint.setdefault(fingerprint, thread)
+        all_by_signature.setdefault(signature, thread)
+        if not thread.get("is_resolved"):
+            unresolved_by_fingerprint.setdefault(fingerprint, thread)
+            unresolved_by_signature.setdefault(signature, thread)
+
+    used_thread_ids: set[str] = set()
+    planned_findings: list[dict[str, Any]] = []
+    new_inline_candidates: list[dict[str, Any]] = []
+    reopened_thread_ids: list[str] = []
+    still_open_count = 0
+
+    for finding in findings:
+        planned_finding = dict(finding)
+        planned_finding["matched_thread_id"] = None
+        planned_finding["thread_action"] = "new"
+        planned_finding["selected_for_inline"] = False
+
+        candidate_fingerprints: list[str] = []
+        previous_fingerprint = planned_finding.get("previous_fingerprint")
+        if isinstance(previous_fingerprint, str) and previous_fingerprint:
+            candidate_fingerprints.append(previous_fingerprint)
+        fingerprint = planned_finding.get("fingerprint")
+        if isinstance(fingerprint, str) and fingerprint and fingerprint not in candidate_fingerprints:
+            candidate_fingerprints.append(fingerprint)
+
+        matched_thread: dict[str, Any] | None = None
+        for candidate in candidate_fingerprints:
+            thread = unresolved_by_fingerprint.get(candidate)
+            if thread and thread["thread_id"] not in used_thread_ids:
+                matched_thread = thread
+                break
+        if matched_thread is None:
+            for candidate in candidate_fingerprints:
+                thread = all_by_fingerprint.get(candidate)
+                if thread and thread["thread_id"] not in used_thread_ids:
+                    matched_thread = thread
+                    break
+        if matched_thread is None:
+            signature = _finding_signature(planned_finding)
+            thread = unresolved_by_signature.get(signature)
+            if thread and thread["thread_id"] not in used_thread_ids:
+                matched_thread = thread
+        if matched_thread is None:
+            signature = _finding_signature(planned_finding)
+            thread = all_by_signature.get(signature)
+            if thread and thread["thread_id"] not in used_thread_ids:
+                matched_thread = thread
+
+        if matched_thread is not None:
+            thread_id = matched_thread["thread_id"]
+            used_thread_ids.add(thread_id)
+            planned_finding["matched_thread_id"] = thread_id
+            if matched_thread.get("is_resolved"):
+                planned_finding["thread_action"] = "reopen"
+                reopened_thread_ids.append(thread_id)
+            else:
+                planned_finding["thread_action"] = "keep_open"
+                still_open_count += 1
+        else:
+            new_inline_candidates.append(planned_finding)
+
+        planned_findings.append(planned_finding)
+
+    resolve_thread_ids = [
+        thread["thread_id"]
+        for thread in managed_threads
+        if not thread.get("is_resolved") and thread["thread_id"] not in used_thread_ids
+    ]
+
+    created_inline_findings: list[dict[str, Any]] = []
+    unplaced_inline_count = 0
+    truncated_inline_count = 0
+    for finding in new_inline_candidates:
+        if finding.get("priority", 99) > 1:
+            continue
+        if not finding.get("inline_placeable"):
+            finding["thread_action"] = "unplaced"
+            unplaced_inline_count += 1
+            continue
+        if len(created_inline_findings) < max_inline_comments:
+            finding["thread_action"] = "create"
+            finding["selected_for_inline"] = True
+            created_inline_findings.append(finding)
+            continue
+        finding["thread_action"] = "truncated"
+        truncated_inline_count += 1
+
+    return {
+        "planned_findings": planned_findings,
+        "create_inline_findings": created_inline_findings,
+        "resolve_thread_ids": resolve_thread_ids,
+        "reopen_thread_ids": reopened_thread_ids,
+        "posted_inline_count": len(created_inline_findings),
+        "unplaced_inline_count": unplaced_inline_count,
+        "truncated_inline_count": truncated_inline_count,
+        "thread_lifecycle_counts": {
+            "new": len(created_inline_findings),
+            "still_open": still_open_count,
+            "reopened": len(reopened_thread_ids),
+            "resolved": len(resolve_thread_ids),
+        },
     }
 
 
@@ -354,6 +630,7 @@ def render_summary_body(
     posted_inline_count: int,
     unplaced_inline_count: int,
     truncated_inline_count: int,
+    thread_lifecycle_counts: dict[str, int] | None,
     run_url: str,
     artifact_url: str,
 ) -> str:
@@ -397,6 +674,13 @@ def render_summary_body(
         (
             f"Inline comments: posted `{posted_inline_count}` | "
             f"unplaced `{unplaced_inline_count}` | truncated `{truncated_inline_count}`"
+        ),
+        (
+            "Thread lifecycle: "
+            f"new `{(thread_lifecycle_counts or {}).get('new', 0)}` | "
+            f"still open `{(thread_lifecycle_counts or {}).get('still_open', 0)}` | "
+            f"reopened `{(thread_lifecycle_counts or {}).get('reopened', 0)}` | "
+            f"resolved `{(thread_lifecycle_counts or {}).get('resolved', 0)}`"
         ),
         f"Admin override: {override_summary}",
         f"Override source: `{override_source}`",

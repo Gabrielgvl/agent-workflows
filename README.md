@@ -119,7 +119,11 @@ jobs:
 - The review prompt treats same-owner reusable workflows and actions as
   first-party infrastructure, so it does not raise supply-chain findings solely
   because those refs use a major tag such as `@v1`.
-- Managed inline comments are replaced on reruns instead of accumulating.
+- Managed inline review threads are preserved on reruns. The workflow resolves
+  threads for fixed findings, reopens matching threads when an issue comes
+  back, and only creates new inline threads for genuinely new findings.
+- Unresolved managed findings are fed back into the next Codex prompt so reruns
+  revalidate prior issues before searching for more.
 - The caller workflow must grant `actions: read` so the reusable workflow can
   resolve its own pinned source from the current run metadata.
 - The review helper runs Codex with `--sandbox danger-full-access`. This is

@@ -5,14 +5,13 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
-import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from codex_review_lib import (
-    INLINE_MARKER_PREFIX,
     build_inline_comment_body,
+    plan_thread_actions,
     render_summary_body,
 )
 
@@ -61,6 +60,31 @@ def _request(
         return exc.code, parsed
 
 
+def _graphql_request(
+    *,
+    graphql_url: str,
+    token: str,
+    query: str,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    status, payload = _request(
+        "POST",
+        graphql_url,
+        token=token,
+        body={"query": query, "variables": variables},
+    )
+    if status != 200:
+        raise RuntimeError(f"GitHub GraphQL request failed ({status}): {payload}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected GitHub GraphQL response: {payload}")
+    if payload.get("errors"):
+        raise RuntimeError(f"GitHub GraphQL request returned errors: {payload['errors']}")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError(f"GitHub GraphQL response did not include a data object: {payload}")
+    return data
+
+
 def _paginate(url: str, *, token: str) -> list[dict[str, Any]]:
     page = 1
     items: list[dict[str, Any]] = []
@@ -77,35 +101,6 @@ def _paginate(url: str, *, token: str) -> list[dict[str, Any]]:
             break
         page += 1
     return items
-
-
-def _delete_managed_review_comments(
-    *,
-    api_url: str,
-    owner: str,
-    repo: str,
-    pull_number: str,
-    token: str,
-) -> None:
-    comments = _paginate(
-        f"{api_url}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
-        token=token,
-    )
-    for comment in comments:
-        body = comment.get("body") or ""
-        if comment.get("user", {}).get("type") != "Bot":
-            continue
-        if INLINE_MARKER_PREFIX not in body:
-            continue
-        status, payload = _request(
-            "DELETE",
-            f"{api_url}/repos/{owner}/{repo}/pulls/comments/{comment['id']}",
-            token=token,
-        )
-        if status not in {204, 404}:
-            raise RuntimeError(
-                f"Failed to delete managed review comment {comment['id']} ({status}): {payload}"
-            )
 
 
 def _upsert_summary_comment(
@@ -201,9 +196,6 @@ def _post_inline_comments(
     truncated = initial_truncated_count
 
     for finding in findings:
-        if not finding.get("selected_for_inline"):
-            continue
-
         body = {
             "body": build_inline_comment_body(finding),
             "commit_id": head_sha,
@@ -234,36 +226,109 @@ def _post_inline_comments(
     return posted, unplaced, truncated
 
 
+def _mutate_review_thread(
+    *,
+    graphql_url: str,
+    token: str,
+    thread_id: str,
+    action: str,
+) -> None:
+    if action not in {"resolve", "unresolve"}:
+        raise RuntimeError(f"Unsupported review thread action: {action}")
+
+    mutation_name = "resolveReviewThread" if action == "resolve" else "unresolveReviewThread"
+    query = f"""
+    mutation($threadId: ID!) {{
+      {mutation_name}(input: {{threadId: $threadId}}) {{
+        thread {{
+          id
+          isResolved
+        }}
+      }}
+    }}
+    """
+    _graphql_request(
+        graphql_url=graphql_url,
+        token=token,
+        query=query,
+        variables={"threadId": thread_id},
+    )
+
+
+def _load_managed_threads(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    managed_threads = payload.get("managed_threads")
+    if not isinstance(managed_threads, list):
+        raise RuntimeError(f"Invalid managed thread payload in {path}: {payload}")
+    return managed_threads
+
+
 def main() -> int:
     token = _env("GITHUB_TOKEN")
     api_url = _env("GITHUB_API_URL", "https://api.github.com")
+    graphql_url = _env("GITHUB_GRAPHQL_URL", "https://api.github.com/graphql")
     repository = _env("GITHUB_REPOSITORY")
     pull_number = _env("GITHUB_PULL_NUMBER")
     head_sha = _env("GITHUB_HEAD_SHA")
 
     owner, repo = repository.split("/", 1)
     state_path = Path(_env("CODEX_REVIEW_STATE_PATH", "codex-review-state.json"))
+    prior_threads_path = Path(
+        _env("CODEX_REVIEW_PRIOR_THREADS_PATH", "codex-review-prior-threads.json")
+    )
     state = json.loads(state_path.read_text(encoding="utf-8"))
+    managed_threads = _load_managed_threads(prior_threads_path)
+    should_reconcile_threads = state.get("codex_exit_code") == 0 and not state.get("parse_failed")
+    action_plan = {
+        "create_inline_findings": [],
+        "resolve_thread_ids": [],
+        "reopen_thread_ids": [],
+        "unplaced_inline_count": 0,
+        "truncated_inline_count": 0,
+        "thread_lifecycle_counts": {"new": 0, "still_open": 0, "reopened": 0, "resolved": 0},
+    }
 
-    _delete_managed_review_comments(
-        api_url=api_url,
-        owner=owner,
-        repo=repo,
-        pull_number=pull_number,
-        token=token,
-    )
+    posted_inline_count = 0
+    unplaced_inline_count = 0
+    truncated_inline_count = 0
+    thread_lifecycle_counts = dict(action_plan["thread_lifecycle_counts"])
 
-    posted_inline_count, unplaced_inline_count, truncated_inline_count = _post_inline_comments(
-        api_url=api_url,
-        owner=owner,
-        repo=repo,
-        pull_number=pull_number,
-        head_sha=head_sha,
-        token=token,
-        findings=state.get("findings", []),
-        initial_unplaced_count=int(state.get("unplaced_inline_count", 0)),
-        initial_truncated_count=int(state.get("truncated_inline_count", 0)),
-    )
+    if should_reconcile_threads:
+        action_plan = plan_thread_actions(
+            state.get("findings", []),
+            managed_threads=managed_threads,
+            max_inline_comments=int(state.get("max_inline_comments", 10)),
+        )
+
+        for thread_id in action_plan["resolve_thread_ids"]:
+            _mutate_review_thread(
+                graphql_url=graphql_url,
+                token=token,
+                thread_id=thread_id,
+                action="resolve",
+            )
+        for thread_id in action_plan["reopen_thread_ids"]:
+            _mutate_review_thread(
+                graphql_url=graphql_url,
+                token=token,
+                thread_id=thread_id,
+                action="unresolve",
+            )
+
+        posted_inline_count, unplaced_inline_count, truncated_inline_count = _post_inline_comments(
+            api_url=api_url,
+            owner=owner,
+            repo=repo,
+            pull_number=pull_number,
+            head_sha=head_sha,
+            token=token,
+            findings=action_plan["create_inline_findings"],
+            initial_unplaced_count=action_plan["unplaced_inline_count"],
+            initial_truncated_count=action_plan["truncated_inline_count"],
+        )
+
+        thread_lifecycle_counts = dict(action_plan["thread_lifecycle_counts"])
+        thread_lifecycle_counts["new"] = posted_inline_count
 
     summary_body = render_summary_body(
         state,
@@ -275,6 +340,7 @@ def main() -> int:
         posted_inline_count=posted_inline_count,
         unplaced_inline_count=unplaced_inline_count,
         truncated_inline_count=truncated_inline_count,
+        thread_lifecycle_counts=thread_lifecycle_counts,
         run_url=_env("GITHUB_RUN_URL"),
         artifact_url=_env("GITHUB_ARTIFACT_URL"),
     )
