@@ -20,9 +20,9 @@ other agent tools without changing the repository identity.
 ## Auth contract
 
 The shared review workflow restores a Codex CLI auth bundle from
-`codex_auth_json_b64`.
+`codex_auth_json`.
 
-The helper scripts decode the secret into an isolated `~/.codex/auth.json`,
+The helper scripts restore the secret into an isolated `~/.codex/auth.json`,
 validate the restored bundle shape, and run the review without relying on
 runner-local Codex state. This keeps the workflow aligned with the current
 Orbio CI contract: restored Codex session credentials in a temporary isolated
@@ -79,7 +79,7 @@ jobs:
       review_reasoning_effort: low
       max_inline_comments: "10"
     secrets:
-      codex_auth_json_b64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
+      codex_auth_json: ${{ secrets.CODEX_AUTH_JSON }}
 ```
 
 Example override caller:
@@ -158,8 +158,8 @@ Runner and installation inputs:
 
 Secrets:
 
-- `codex_auth_json_b64`
-  Required. Base64-encoded Codex CLI `auth.json` restored into an isolated
+- `codex_auth_json`
+  Required. The raw Codex CLI `auth.json` document restored into an isolated
   temporary home for the review run.
 
 ## Release guidance

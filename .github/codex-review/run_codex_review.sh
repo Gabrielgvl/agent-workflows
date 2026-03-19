@@ -14,7 +14,7 @@ review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-900}"
 review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-low}"
 review_reasoning_summary="${CODEX_REVIEW_REASONING_SUMMARY:-}"
 review_verbosity="${CODEX_REVIEW_VERBOSITY:-}"
-auth_json_b64="${CODEX_AUTH_JSON_B64:-}"
+auth_json="${CODEX_AUTH_JSON:-}"
 runner_temp_root="${RUNNER_TEMP:-$PWD/.tmp/codex-review}"
 timeout_bin=""
 stdbuf_bin=""
@@ -76,8 +76,8 @@ if [[ -z "$review_base" ]]; then
   exit 2
 fi
 
-if [[ -z "$auth_json_b64" ]]; then
-  printf 'ERROR: CODEX_AUTH_JSON_B64 is required.\n' > "$review_log_path"
+if [[ -z "$auth_json" ]]; then
+  printf 'ERROR: CODEX_AUTH_JSON is required.\n' > "$review_log_path"
   cat "$review_log_path"
   exit 2
 fi
@@ -269,22 +269,20 @@ for key in ("access_token", "id_token", "refresh_token"):
 PY
 }
 
-if ! AUTH_JSON_B64="$auth_json_b64" python3 - "$codex_auth_path" <<'PY'
-import base64
+if ! AUTH_JSON="$auth_json" python3 - "$codex_auth_path" <<'PY'
 import os
 import pathlib
 import sys
 
-payload = os.environ.get("AUTH_JSON_B64", "").strip()
+payload = os.environ.get("AUTH_JSON", "")
 if not payload:
-    raise SystemExit("CODEX_AUTH_JSON_B64 is empty.")
+    raise SystemExit("CODEX_AUTH_JSON is empty.")
 
-decoded = base64.b64decode(payload.encode("utf-8"), validate=True)
 path = pathlib.Path(sys.argv[1])
-path.write_bytes(decoded)
+path.write_text(payload, encoding="utf-8")
 PY
 then
-  printf 'ERROR: failed to decode CODEX_AUTH_JSON_B64 into auth.json.\n' > "$review_log_path"
+  printf 'ERROR: failed to write CODEX_AUTH_JSON into auth.json.\n' > "$review_log_path"
   cat "$review_log_path"
   exit 2
 fi
