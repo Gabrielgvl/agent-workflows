@@ -334,7 +334,17 @@ cleanup() {
     wait "$heartbeat_pid" 2>/dev/null || true
     heartbeat_pid=""
   fi
-  rm -rf "$codex_home_parent" "$codex_zdotdir" "$toolchain_wrapper_dir"
+
+  local cleanup_path
+  for cleanup_path in "$codex_home_parent" "$codex_zdotdir" "$toolchain_wrapper_dir"; do
+    [[ -z "$cleanup_path" ]] && continue
+    chmod -R u+w "$cleanup_path" >/dev/null 2>&1 || true
+    rm -rf "$cleanup_path" >/dev/null 2>&1 || true
+    if [[ -e "$cleanup_path" ]]; then
+      printf '[%s] WARN: unable to fully remove temporary path %s\n' \
+        "$(timestamp_utc)" "$cleanup_path" >> "$review_log_path" 2>/dev/null || true
+    fi
+  done
 }
 trap cleanup EXIT
 
