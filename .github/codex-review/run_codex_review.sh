@@ -12,8 +12,8 @@ prior_open_findings_path="${CODEX_REVIEW_PRIOR_OPEN_FINDINGS_PATH:-codex-review-
 review_base="${CODEX_REVIEW_BASE:-}"
 repository_owner="${CODEX_REVIEW_REPOSITORY_OWNER:-}"
 review_model="${CODEX_REVIEW_MODEL:-gpt-5.4}"
-review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-600}"
-review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-low}"
+review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-900}"
+review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-medium}"
 review_reasoning_summary="${CODEX_REVIEW_REASONING_SUMMARY:-}"
 review_verbosity="${CODEX_REVIEW_VERBOSITY:-}"
 auth_json="${CODEX_AUTH_JSON:-}"
@@ -27,6 +27,7 @@ wrapped_codex_bin=""
 toolchain_wrapper_dir=""
 original_home="${HOME:-}"
 original_volta_home="${VOLTA_HOME:-}"
+workflow_helpers_dir="${WORKFLOW_HELPERS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 mkdir -p "$runner_temp_root"
 rm -f \
@@ -214,114 +215,52 @@ cat > "$schema_path" <<'JSON'
 }
 JSON
 
-cat > "$prompt_path" <<EOF
-You are acting as a reviewer for a proposed code change made by another engineer.
-
-Review only the pull request changes introduced by comparing \`origin/${review_base}...HEAD\`.
-The repository root is the current working directory.
-
-Focus on actionable issues that affect correctness, performance, security, maintainability, or developer experience.
-Flag only issues introduced by this pull request.
-Do not report style nits, speculative concerns, or pre-existing issues.
-Prioritize the unified diff and changed files list first.
-Inspect unchanged files only when required to confirm a concrete issue, and read the smallest necessary context.
-Use the available tools to inspect the repository, changed files, and diff before deciding whether to raise a finding.
-
-Return JSON that matches the provided schema and nothing else.
-
-Output requirements:
-- Use repo-relative POSIX paths in the \`path\` field.
-- Use exact HEAD-side line numbers from the changed diff.
-- Set \`priority\` to 0 for the most severe blocking issues and 3 for the least severe findings.
-- Keep \`title\` short and direct.
-- Make \`body\` concise, specific, and actionable.
-- When a currently valid finding matches a previously open finding, copy its \`previous_fingerprint\` exactly into the result.
-- Set \`previous_fingerprint\` to \`null\` for genuinely new findings.
-- After revalidating any previously open findings, continue looking for additional new issues.
-- Return only findings that are still valid on the current HEAD. Omit previously open findings that are now resolved.
-- If there are no actionable findings, return an empty \`findings\` array.
-- Use \`overall_correctness\` of \`patch is correct\` only when the patch is safe to merge as-is.
-
-Context:
-- Base ref: origin/${review_base}
-- Base SHA: ${base_sha}
-- Merge base SHA: ${merge_base}
-- Head SHA: ${head_sha}
-- Changed files list: $(basename "$changed_files_path")
-- Unified diff: $(basename "$diff_path")
-EOF
-
-if [[ -n "$repository_owner" ]]; then
-  cat >> "$prompt_path" <<EOF
-- Treat GitHub Actions reusable workflows and actions from repositories owned by ${repository_owner} as first-party trusted infrastructure for this repository.
-- Do not raise findings solely because those same-owner workflow or action references use a major version tag such as \`@v1\`.
-- Still raise findings for mutable refs from external owners, or for same-owner workflow changes that expand permissions, secrets exposure, or other concrete risk.
-EOF
-fi
-
-prior_open_findings_count=0
-if [[ -f "$prior_open_findings_path" ]]; then
-  prior_open_findings_count="$(python3 - "$prior_open_findings_path" "$prompt_path" <<'PY'
+prior_open_findings_count="$(python3 - "$workflow_helpers_dir/codex_review_lib.py" "$prompt_path" "$review_base" "$base_sha" "$merge_base" "$head_sha" "$(basename "$changed_files_path")" "$(basename "$diff_path")" "$repository_owner" "$prior_open_findings_path" <<'PY'
+import importlib.util
 import json
 import pathlib
 import sys
 
-prior_path = pathlib.Path(sys.argv[1])
+module_path = pathlib.Path(sys.argv[1])
 prompt_path = pathlib.Path(sys.argv[2])
-payload = json.loads(prior_path.read_text(encoding="utf-8"))
-findings = payload.get("open_findings")
-if not isinstance(findings, list):
-    raise SystemExit("open_findings payload must include an open_findings array.")
+review_base = sys.argv[3]
+base_sha = sys.argv[4]
+merge_base = sys.argv[5]
+head_sha = sys.argv[6]
+changed_files_filename = sys.argv[7]
+diff_filename = sys.argv[8]
+repository_owner = sys.argv[9]
+prior_path = pathlib.Path(sys.argv[10])
 
-if not findings:
-    print("0")
-    raise SystemExit(0)
+spec = importlib.util.spec_from_file_location("codex_review_lib", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
 
-lines = [
-    "",
-    "Revalidate these currently open Codex findings before looking for new issues:",
-]
-for finding in findings:
-    previous_fingerprint = str(finding.get("previous_fingerprint") or "").strip()
-    title = str(finding.get("title") or "").strip()
-    body = str(finding.get("body") or "").strip()
-    path = str(finding.get("path") or "").strip()
-    start_line = finding.get("start_line")
-    end_line = finding.get("end_line")
-    priority_label = str(finding.get("priority_label") or "").strip()
-    if (
-        not previous_fingerprint
-        or not title
-        or not body
-        or not path
-        or not priority_label
-        or not isinstance(start_line, int)
-        or not isinstance(end_line, int)
-    ):
-        raise SystemExit("Each open prior finding must include previous_fingerprint, title, body, path, start_line, end_line, and priority_label.")
-    location = (
-        f"{path}:{start_line}"
-        if start_line == end_line
-        else f"{path}:{start_line}-{end_line}"
-    )
-    lines.extend(
-        [
-            "",
-            f"- previous_fingerprint: {previous_fingerprint}",
-            f"  priority: {priority_label}",
-            f"  location: {location}",
-            f"  title: {title}",
-            f"  body: {body}",
-        ]
-    )
+prior_open_findings = []
+if prior_path.is_file():
+    payload = json.loads(prior_path.read_text(encoding="utf-8"))
+    prior_open_findings = payload.get("open_findings")
+    if not isinstance(prior_open_findings, list):
+        raise SystemExit("open_findings payload must include an open_findings array.")
 
-with prompt_path.open("a", encoding="utf-8") as handle:
-    handle.write("\n".join(lines) + "\n")
+prompt_path.write_text(
+    module.build_review_prompt(
+        review_base=review_base,
+        base_sha=base_sha,
+        merge_base=merge_base,
+        head_sha=head_sha,
+        changed_files_filename=changed_files_filename,
+        diff_filename=diff_filename,
+        repository_owner=repository_owner,
+        prior_open_findings=prior_open_findings,
+    ),
+    encoding="utf-8",
+)
 
-print(str(len(findings)))
+print(str(len(prior_open_findings)))
 PY
 )"
-fi
 
 codex_home_parent="$(mktemp -d "${runner_temp_root%/}/codex-home.XXXXXX")"
 codex_zdotdir="$(mktemp -d "${runner_temp_root%/}/codex-zdotdir.XXXXXX")"

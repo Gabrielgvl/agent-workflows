@@ -199,6 +199,59 @@ index 1111111..2222222 100644
         self.assertEqual(counts["unplaced_inline_count"], 1)
 
 
+class PromptBuilderTests(unittest.TestCase):
+    def test_builds_exhaustive_blocker_first_prompt(self) -> None:
+        prompt = lib.build_review_prompt(
+            review_base="main",
+            base_sha="a" * 40,
+            merge_base="b" * 40,
+            head_sha="c" * 40,
+            changed_files_filename="codex-changed-files.txt",
+            diff_filename="codex-review.diff",
+            repository_owner="Gabrielgvl",
+            prior_open_findings=[
+                {
+                    "previous_fingerprint": "abcd1234abcd1234",
+                    "priority_label": "P1",
+                    "title": "Regression is still present",
+                    "body": "The guard is still missing after the rerun.",
+                    "path": "src/review.py",
+                    "start_line": 22,
+                    "end_line": 22,
+                }
+            ],
+        )
+
+        self.assertIn("Review every changed file and every changed diff hunk before returning.", prompt)
+        self.assertIn("Treat revalidation of previously open findings as one checklist item, not the end of the review.", prompt)
+        self.assertIn("Do not stop after finding the first one or two issues.", prompt)
+        self.assertIn("Return all actionable P0/P1 findings you can substantiate from the current HEAD, not just a sample.", prompt)
+        self.assertIn("Revalidate these currently open Codex findings before the full blocker-first sweep across the diff:", prompt)
+        self.assertIn("previous_fingerprint: abcd1234abcd1234", prompt)
+        self.assertIn("Treat GitHub Actions reusable workflows and actions from repositories owned by Gabrielgvl as first-party trusted infrastructure", prompt)
+
+    def test_rejects_invalid_prior_open_findings_for_prompt(self) -> None:
+        with self.assertRaisesRegex(ValueError, "prior_open_findings\\[0\\]\\.priority_label"):
+            lib.build_review_prompt(
+                review_base="main",
+                base_sha="a" * 40,
+                merge_base="b" * 40,
+                head_sha="c" * 40,
+                changed_files_filename="codex-changed-files.txt",
+                diff_filename="codex-review.diff",
+                prior_open_findings=[
+                    {
+                        "previous_fingerprint": "abcd1234abcd1234",
+                        "title": "Regression is still present",
+                        "body": "The guard is still missing after the rerun.",
+                        "path": "src/review.py",
+                        "start_line": 22,
+                        "end_line": 22,
+                    }
+                ],
+            )
+
+
 class SummaryRenderingTests(unittest.TestCase):
     def test_renders_summary_body(self) -> None:
         state = {
@@ -241,6 +294,61 @@ class SummaryRenderingTests(unittest.TestCase):
         self.assertIn("Model: `gpt-5.4`", body)
         self.assertIn("`src/app.py:12`", body)
         self.assertIn("Finding lifecycle: new `1`", body)
+
+    def test_renders_all_blocking_findings_without_truncation(self) -> None:
+        findings = []
+        for line_number in range(10, 16):
+            findings.append(
+                {
+                    "priority": 1,
+                    "priority_label": "P1",
+                    "path": f"src/file{line_number}.py",
+                    "start_line": line_number,
+                    "end_line": line_number,
+                    "title": f"Blocking issue {line_number}",
+                }
+            )
+        findings.append(
+            {
+                "priority": 2,
+                "priority_label": "P2",
+                "path": "src/non_blocking.py",
+                "start_line": 40,
+                "end_line": 40,
+                "title": "Minor follow-up",
+            }
+        )
+
+        state = {
+            "codex_exit_code": 0,
+            "parse_failed": False,
+            "parse_error": "",
+            "review_model": "gpt-5.4",
+            "overall_correctness": "patch is incorrect",
+            "overall_explanation": "Several blockers were found.",
+            "overall_confidence_score": 0.95,
+            "counts": {"P0": 0, "P1": 6, "P2": 1, "P3": 0},
+            "findings": findings,
+        }
+
+        body = lib.render_summary_body(
+            state,
+            override_active=False,
+            override_stale=False,
+            override_approved_by="",
+            override_approved_sha="",
+            override_source="none",
+            posted_inline_count=6,
+            unplaced_inline_count=0,
+            truncated_inline_count=1,
+            thread_lifecycle_counts={"new": 6, "still_open": 0, "reopened": 0, "resolved": 0},
+            run_url="https://github.com/example/repo/actions/runs/1",
+            artifact_url="https://github.com/example/repo/actions/runs/1#artifacts",
+        )
+
+        for line_number in range(10, 16):
+            self.assertIn(f"`src/file{line_number}.py:{line_number}`", body)
+        self.assertIn("plus 1 non-blocking finding(s)", body)
 
 
 class ThreadActionPlanningTests(unittest.TestCase):

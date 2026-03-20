@@ -76,7 +76,7 @@ jobs:
       install_codex_cli: true
       codex_version: "0.115.0"
       review_model: "gpt-5.4"
-      review_reasoning_effort: low
+      review_reasoning_effort: medium
       max_inline_comments: "10"
     secrets:
       codex_auth_json: ${{ secrets.CODEX_AUTH_JSON }}
@@ -111,6 +111,9 @@ jobs:
 - Blocking findings are published as native inline PR review comments.
 - The workflow always maintains one sticky PR summary comment with the current
   verdict, counts, override state, and workflow links.
+- The review prompt performs an exhaustive blocker-first sweep of every changed
+  file and diff hunk before returning, so the first run is biased toward
+  surfacing all P0 and P1 findings instead of only the first couple discovered.
 - The review helper emits timestamped progress logs while Codex is running so
   long inference steps do not look frozen in Actions.
 - The review helper pins the runner's existing `codex` executable behind a
@@ -120,8 +123,8 @@ jobs:
   first-party infrastructure, so it does not raise supply-chain findings solely
   because those refs use a major tag such as `@v1`.
 - Unresolved managed findings from the previous bot run are fed back into the
-  next Codex prompt so reruns revalidate prior issues before searching for
-  more.
+  next Codex prompt so reruns revalidate prior issues as part of a full
+  blocker-first sweep across the diff.
 - Managed inline comments are refreshed on reruns. GitHub's default workflow
   token cannot resolve review threads, so the workflow keeps rerun context in
   the prompt and sticky summary instead of mutating thread state in place.
@@ -144,7 +147,7 @@ Primary review inputs:
   review-specialized recommendation.
 - `review_reasoning_effort`
   Allowed: `minimal`, `low`, `medium`, `high`, `xhigh`
-  Default: `low`
+  Default: `medium`
 - `review_reasoning_summary`
   Allowed: `auto`, `concise`, `detailed`, `none`
   Default: unset
@@ -169,7 +172,7 @@ Runner and installation inputs:
   `@openai/codex` version used when `install_codex_cli` is true
 - `review_timeout_seconds`
   Inner Codex execution timeout
-  Default: `600`
+  Default: `900`
 - `override_label`
   Label used by the override workflow to mark an approved P1 exception
 

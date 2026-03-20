@@ -12,6 +12,7 @@ SUMMARY_MARKER = "<!-- codex-pr-review -->"
 INLINE_MARKER_PREFIX = "<!-- codex-pr-review-inline:"
 INLINE_MARKER_SUFFIX = " -->"
 PRIORITY_LABELS = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
+REVERSE_PRIORITY_LABELS = {label: priority for priority, label in PRIORITY_LABELS.items()}
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 INLINE_MARKER_RE = re.compile(r"<!-- codex-pr-review-inline:([0-9a-f]{16}) -->")
 INLINE_COMMENT_RE = re.compile(
@@ -58,10 +59,9 @@ def _coerce_text(value: Any, *, field_name: str) -> str:
 
 def _parse_priority_label(value: Any, *, field_name: str) -> tuple[int, str]:
     label = _coerce_text(value, field_name=field_name)
-    reverse_map = {label: priority for priority, label in PRIORITY_LABELS.items()}
-    if label not in reverse_map:
-        raise ValueError(f"{field_name} must be one of: {', '.join(reverse_map)}.")
-    return reverse_map[label], label
+    if label not in REVERSE_PRIORITY_LABELS:
+        raise ValueError(f"{field_name} must be one of: {', '.join(REVERSE_PRIORITY_LABELS)}.")
+    return REVERSE_PRIORITY_LABELS[label], label
 
 
 def _compute_fingerprint(
@@ -117,6 +117,73 @@ def _finding_signature(finding: dict[str, Any]) -> tuple[int, str, int, int, str
         int(finding["end_line"]),
         str(finding["title"]).strip().lower(),
     )
+
+
+def _format_finding_location(path: str, start_line: int, end_line: int) -> str:
+    if start_line == end_line:
+        return f"{path}:{start_line}"
+    return f"{path}:{start_line}-{end_line}"
+
+
+def _finding_priority_label(finding: dict[str, Any]) -> str:
+    priority_label = finding.get("priority_label")
+    if isinstance(priority_label, str) and priority_label in REVERSE_PRIORITY_LABELS:
+        return priority_label
+
+    priority = finding.get("priority")
+    if isinstance(priority, int) and priority in PRIORITY_LABELS:
+        return PRIORITY_LABELS[priority]
+
+    return ""
+
+
+def _normalize_prior_open_finding_for_prompt(
+    raw_finding: Any,
+    *,
+    index: int,
+) -> dict[str, Any]:
+    if not isinstance(raw_finding, dict):
+        raise ValueError(f"prior_open_findings[{index}] must be an object.")
+
+    previous_fingerprint = _coerce_text(
+        raw_finding.get("previous_fingerprint"),
+        field_name=f"prior_open_findings[{index}].previous_fingerprint",
+    )
+    title = _coerce_text(
+        raw_finding.get("title"),
+        field_name=f"prior_open_findings[{index}].title",
+    )
+    body = _coerce_text(
+        raw_finding.get("body"),
+        field_name=f"prior_open_findings[{index}].body",
+    )
+    path = normalize_repo_path(raw_finding.get("path"))
+    start_line = _coerce_int(
+        raw_finding.get("start_line"),
+        field_name=f"prior_open_findings[{index}].start_line",
+    )
+    end_line = _coerce_int(
+        raw_finding.get("end_line"),
+        field_name=f"prior_open_findings[{index}].end_line",
+    )
+    if start_line < 1 or end_line < 1:
+        raise ValueError(f"prior_open_findings[{index}] line numbers must be >= 1.")
+    if end_line < start_line:
+        raise ValueError(f"prior_open_findings[{index}].end_line must be >= start_line.")
+    _, priority_label = _parse_priority_label(
+        raw_finding.get("priority_label"),
+        field_name=f"prior_open_findings[{index}].priority_label",
+    )
+
+    return {
+        "previous_fingerprint": previous_fingerprint,
+        "priority_label": priority_label,
+        "title": title,
+        "body": body,
+        "path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+    }
 
 
 def normalize_repo_path(raw_path: Any) -> str:
@@ -354,6 +421,116 @@ def build_open_prior_findings(managed_threads: list[dict[str, Any]]) -> list[dic
     return open_findings
 
 
+def build_review_prompt(
+    *,
+    review_base: str,
+    base_sha: str,
+    merge_base: str,
+    head_sha: str,
+    changed_files_filename: str,
+    diff_filename: str,
+    repository_owner: str = "",
+    prior_open_findings: list[dict[str, Any]] | None = None,
+) -> str:
+    normalized_review_base = _coerce_text(review_base, field_name="review_base")
+    normalized_base_sha = _coerce_text(base_sha, field_name="base_sha")
+    normalized_merge_base = _coerce_text(merge_base, field_name="merge_base")
+    normalized_head_sha = _coerce_text(head_sha, field_name="head_sha")
+    normalized_changed_files = _coerce_text(
+        changed_files_filename,
+        field_name="changed_files_filename",
+    )
+    normalized_diff = _coerce_text(diff_filename, field_name="diff_filename")
+    normalized_repository_owner = str(repository_owner or "").strip()
+
+    lines = [
+        "You are acting as a reviewer for a proposed code change made by another engineer.",
+        "",
+        f"Review only the pull request changes introduced by comparing `origin/{normalized_review_base}...HEAD`.",
+        "The repository root is the current working directory.",
+        "",
+        "Primary goal: produce an exhaustive blocker-first review of this pull request on the current HEAD.",
+        "Review every changed file and every changed diff hunk before returning.",
+        "Treat revalidation of previously open findings as one checklist item, not the end of the review.",
+        "Do not stop after finding the first one or two issues.",
+        "Before returning, check whether additional P0 or P1 issues exist elsewhere in the diff.",
+        "After the blocker sweep is complete, include any clear P2/P3 findings you discovered.",
+        "",
+        "Focus on actionable issues that affect correctness, performance, security, maintainability, or developer experience.",
+        "Flag only issues introduced by this pull request.",
+        "Do not report style nits, speculative concerns, or pre-existing issues.",
+        "Prioritize complete coverage of the changed files list and unified diff over deep investigation of a single issue.",
+        "Inspect unchanged files only when required to confirm a concrete issue, and read the smallest necessary context.",
+        "Use the available tools to inspect the repository, changed files, and diff before deciding whether to raise a finding.",
+        "",
+        "Return JSON that matches the provided schema and nothing else.",
+        "",
+        "Output requirements:",
+        "- Use repo-relative POSIX paths in the `path` field.",
+        "- Use exact HEAD-side line numbers from the changed diff.",
+        "- Set `priority` to 0 for the most severe blocking issues and 3 for the least severe findings.",
+        "- Keep `title` short and direct.",
+        "- Make `body` concise, specific, and actionable.",
+        "- When a currently valid finding matches a previously open finding, copy its `previous_fingerprint` exactly into the result.",
+        "- Set `previous_fingerprint` to `null` for genuinely new findings.",
+        "- Revalidate previously open findings, then continue the full blocker-first sweep across the diff.",
+        "- Return all actionable P0/P1 findings you can substantiate from the current HEAD, not just a sample.",
+        "- Only finish after checking the rest of the changed files for additional blocking issues.",
+        "- Include P2/P3 findings when they are clear and actionable, but do not let them crowd out the blocker sweep.",
+        "- Return only findings that are still valid on the current HEAD. Omit previously open findings that are now resolved.",
+        "- If there are no actionable findings, return an empty `findings` array.",
+        "- Use `overall_correctness` of `patch is correct` only when the patch is safe to merge as-is.",
+    ]
+
+    if normalized_repository_owner:
+        lines.extend(
+            [
+                "",
+                f"- Treat GitHub Actions reusable workflows and actions from repositories owned by {normalized_repository_owner} as first-party trusted infrastructure for this repository.",
+                "- Do not raise findings solely because those same-owner workflow or action references use a major version tag such as `@v1`.",
+                "- Still raise findings for mutable refs from external owners, or for same-owner workflow changes that expand permissions, secrets exposure, or other concrete risk.",
+            ]
+        )
+
+    normalized_prior_findings = [
+        _normalize_prior_open_finding_for_prompt(raw_finding, index=index)
+        for index, raw_finding in enumerate(prior_open_findings or [])
+    ]
+    if normalized_prior_findings:
+        lines.extend(
+            [
+                "",
+                "Revalidate these currently open Codex findings before the full blocker-first sweep across the diff:",
+            ]
+        )
+        for finding in normalized_prior_findings:
+            lines.extend(
+                [
+                    "",
+                    f"- previous_fingerprint: {finding['previous_fingerprint']}",
+                    f"  priority: {finding['priority_label']}",
+                    f"  location: {_format_finding_location(finding['path'], finding['start_line'], finding['end_line'])}",
+                    f"  title: {finding['title']}",
+                    f"  body: {finding['body']}",
+                ]
+            )
+
+    lines.extend(
+        [
+            "",
+            "Context:",
+            f"- Base ref: origin/{normalized_review_base}",
+            f"- Base SHA: {normalized_base_sha}",
+            f"- Merge base SHA: {normalized_merge_base}",
+            f"- Head SHA: {normalized_head_sha}",
+            f"- Changed files list: {normalized_changed_files}",
+            f"- Unified diff: {normalized_diff}",
+        ]
+    )
+
+    return "\n".join(lines) + "\n"
+
+
 def plan_thread_actions(
     findings: list[dict[str, Any]],
     *,
@@ -566,10 +743,10 @@ def format_confidence(value: float | int | None) -> str:
 
 
 def build_inline_comment_body(finding: dict[str, Any]) -> str:
-    location = (
-        f"{finding['path']}:{finding['start_line']}"
-        if finding["start_line"] == finding["end_line"]
-        else f"{finding['path']}:{finding['start_line']}-{finding['end_line']}"
+    location = _format_finding_location(
+        finding["path"],
+        finding["start_line"],
+        finding["end_line"],
     )
     lines = [
         f"**[{finding['priority_label']}] {finding['title']}**",
@@ -585,18 +762,48 @@ def build_inline_comment_body(finding: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _build_finding_summary_lines(
+    findings: list[dict[str, Any]],
+    *,
+    limit: int | None,
+) -> list[str]:
+    selected_findings = findings if limit is None else findings[:limit]
+    lines: list[str] = []
+    for finding in selected_findings:
+        location = _format_finding_location(
+            finding["path"],
+            finding["start_line"],
+            finding["end_line"],
+        )
+        priority_label = _finding_priority_label(finding) or "Pn"
+        lines.append(f"- [{priority_label}] `{location}` {finding['title']}")
+    return lines
+
+
 def build_top_findings(findings: list[dict[str, Any]], *, limit: int = 5) -> str:
     if not findings:
         return "- none"
 
-    lines: list[str] = []
-    for finding in findings[:limit]:
-        location = (
-            f"{finding['path']}:{finding['start_line']}"
-            if finding["start_line"] == finding["end_line"]
-            else f"{finding['path']}:{finding['start_line']}-{finding['end_line']}"
+    lines = _build_finding_summary_lines(findings, limit=limit)
+    return "\n".join(lines)
+
+
+def build_summary_findings(findings: list[dict[str, Any]]) -> str:
+    if not findings:
+        return "- none"
+
+    blocking_findings = [
+        finding for finding in findings if _finding_priority_label(finding) in {"P0", "P1"}
+    ]
+    if not blocking_findings:
+        return build_top_findings(findings)
+
+    lines = _build_finding_summary_lines(blocking_findings, limit=None)
+    non_blocking_count = len(findings) - len(blocking_findings)
+    if non_blocking_count > 0:
+        lines.append(
+            f"- plus {non_blocking_count} non-blocking finding(s) in the structured output"
         )
-        lines.append(f"- [{finding['priority_label']}] `{location}` {finding['title']}")
     return "\n".join(lines)
 
 
@@ -658,7 +865,7 @@ def render_summary_body(
         verdict_confidence = format_confidence(state["overall_confidence_score"])
         overall_explanation = state["overall_explanation"]
 
-    top_findings = build_top_findings(state["findings"])
+    summary_findings = build_summary_findings(state["findings"])
 
     body = [
         SUMMARY_MARKER,
@@ -692,7 +899,7 @@ def render_summary_body(
         overall_explanation,
         "",
         "**Top findings**",
-        top_findings,
+        summary_findings,
     ]
 
     if total_findings == 0 and not state["parse_failed"]:

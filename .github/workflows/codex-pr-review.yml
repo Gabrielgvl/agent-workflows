@@ -30,11 +30,11 @@ on:
       review_timeout_seconds:
         required: false
         type: string
-        default: "600"
+        default: "900"
       review_reasoning_effort:
         required: false
         type: string
-        default: low
+        default: medium
       review_reasoning_summary:
         required: false
         type: string
@@ -69,7 +69,7 @@ jobs:
   review:
     if: ${{ github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false }}
     runs-on: ${{ fromJSON(inputs.runs_on_json) }}
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
       - name: Validate review inputs
         shell: bash
