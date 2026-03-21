@@ -74,7 +74,7 @@ jobs:
     with:
       runs_on_json: '["self-hosted"]'
       install_codex_cli: true
-      codex_version: "0.115.0"
+      codex_version: "latest"
       review_model: "gpt-5.4"
       review_reasoning_effort: medium
       max_inline_comments: "10"
@@ -170,6 +170,7 @@ Runner and installation inputs:
   Node version used when installing Codex
 - `codex_version`
   `@openai/codex` version used when `install_codex_cli` is true
+  Default: `latest`
 - `review_timeout_seconds`
   Inner Codex execution timeout
   Default: `900`

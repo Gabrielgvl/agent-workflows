@@ -22,7 +22,7 @@ on:
       codex_version:
         required: false
         type: string
-        default: "0.115.0"
+        default: "latest"
       review_model:
         required: false
         type: string
