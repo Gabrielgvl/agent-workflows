@@ -26,7 +26,7 @@ on:
       review_model:
         required: false
         type: string
-        default: gpt-5.4
+        default: gpt-5.3-codex
       review_timeout_seconds:
         required: false
         type: string
