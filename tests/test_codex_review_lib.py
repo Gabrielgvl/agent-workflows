@@ -113,8 +113,12 @@ class ManagedInlineCommentParsingTests(unittest.TestCase):
                 "**[P1] Missing cleanup guard**",
                 "",
                 "`src/app.py:23-24`",
+                "Category: correctness",
                 "",
                 "The cleanup path can dereference a null result.",
+                "",
+                "**Suggested fix:**",
+                "Add a null check before cleanup: if result is not None: cleanup()",
                 "",
                 "Confidence: 0.72",
                 "",
@@ -130,6 +134,8 @@ class ManagedInlineCommentParsingTests(unittest.TestCase):
         self.assertEqual(finding["start_line"], 23)
         self.assertEqual(finding["end_line"], 24)
         self.assertEqual(finding["fingerprint"], "bbbbbbbbbbbbbbbb")
+        self.assertEqual(finding["category"], "correctness")
+        self.assertEqual(finding["suggested_fix"], "Add a null check before cleanup: if result is not None: cleanup()")
 
 
 class InlinePlacementTests(unittest.TestCase):
@@ -158,6 +164,8 @@ index 1111111..2222222 100644
                 "start_line": 9,
                 "end_line": 10,
                 "confidence_score": 0.98,
+                "category": "correctness",
+                "suggested_fix": "Apply appropriate fix based on the issue.",
                 "fingerprint": "aaaa",
             },
             {
@@ -169,6 +177,8 @@ index 1111111..2222222 100644
                 "start_line": 23,
                 "end_line": 23,
                 "confidence_score": 0.72,
+                "category": "correctness",
+                "suggested_fix": "Apply appropriate fix based on the issue.",
                 "fingerprint": "bbbb",
             },
             {
@@ -180,6 +190,8 @@ index 1111111..2222222 100644
                 "start_line": 40,
                 "end_line": 40,
                 "confidence_score": 0.7,
+                "category": "correctness",
+                "suggested_fix": "Apply appropriate fix based on the issue.",
                 "fingerprint": "cccc",
             },
         ]
@@ -222,13 +234,20 @@ class PromptBuilderTests(unittest.TestCase):
             ],
         )
 
-        self.assertIn("Review every changed file and every changed diff hunk before returning.", prompt)
-        self.assertIn("Treat revalidation of previously open findings as one checklist item, not the end of the review.", prompt)
-        self.assertIn("Do not stop after finding the first one or two issues.", prompt)
-        self.assertIn("Return all actionable P0/P1 findings you can substantiate from the current HEAD, not just a sample.", prompt)
+        # Check for new multi-pass methodology
+        self.assertIn("Multi-Pass Review Methodology", prompt)
+        self.assertIn("Category Sweep Per File", prompt)
+        self.assertIn("Reflection and Verification", prompt)
+        self.assertIn("Explicit Stopping Criteria", prompt)
+        self.assertIn("sweep_complete: true", prompt)
+        self.assertIn("suggested_fix", prompt)
         self.assertIn("Revalidate these currently open Codex findings before the full blocker-first sweep across the diff:", prompt)
         self.assertIn("previous_fingerprint: abcd1234abcd1234", prompt)
         self.assertIn("Treat GitHub Actions reusable workflows and actions from repositories owned by Gabrielgvl as first-party trusted infrastructure", prompt)
+        # Check for adversarial framing
+        self.assertIn("adversarial code reviewer", prompt)
+        # Check for category coverage requirement
+        self.assertIn("check ALL six categories", prompt)
 
     def test_rejects_invalid_prior_open_findings_for_prompt(self) -> None:
         with self.assertRaisesRegex(ValueError, "prior_open_findings\\[0\\]\\.priority_label"):
@@ -367,6 +386,8 @@ class ThreadActionPlanningTests(unittest.TestCase):
                     "start_line": 23,
                     "end_line": 23,
                     "confidence_score": 0.71,
+                    "category": "correctness",
+                    "suggested_fix": "Apply appropriate fix based on the issue.",
                     "fingerprint": "openfingerprint01",
                 },
             },
@@ -383,6 +404,8 @@ class ThreadActionPlanningTests(unittest.TestCase):
                     "start_line": 10,
                     "end_line": 10,
                     "confidence_score": 0.99,
+                    "category": "correctness",
+                    "suggested_fix": "Apply appropriate fix based on the issue.",
                     "fingerprint": "resolvedfinding02",
                 },
             },
@@ -399,6 +422,8 @@ class ThreadActionPlanningTests(unittest.TestCase):
                     "start_line": 4,
                     "end_line": 4,
                     "confidence_score": 0.64,
+                    "category": "correctness",
+                    "suggested_fix": "Apply appropriate fix based on the issue.",
                     "fingerprint": "resolvednow0003",
                 },
             },
@@ -413,6 +438,8 @@ class ThreadActionPlanningTests(unittest.TestCase):
                 "start_line": 23,
                 "end_line": 23,
                 "confidence_score": 0.71,
+                "category": "correctness",
+                "suggested_fix": "Apply appropriate fix based on the issue.",
                 "fingerprint": "openfingerprint01",
                 "previous_fingerprint": "openfingerprint01",
                 "inline_placeable": True,
@@ -426,6 +453,8 @@ class ThreadActionPlanningTests(unittest.TestCase):
                 "start_line": 10,
                 "end_line": 10,
                 "confidence_score": 0.99,
+                "category": "correctness",
+                "suggested_fix": "Apply appropriate fix based on the issue.",
                 "fingerprint": "newfingerprint04",
                 "previous_fingerprint": "resolvedfinding02",
                 "inline_placeable": True,
@@ -439,6 +468,8 @@ class ThreadActionPlanningTests(unittest.TestCase):
                 "start_line": 8,
                 "end_line": 8,
                 "confidence_score": 0.88,
+                "category": "correctness",
+                "suggested_fix": "Apply appropriate fix based on the issue.",
                 "fingerprint": "brandnewissue05",
                 "previous_fingerprint": None,
                 "inline_placeable": True,

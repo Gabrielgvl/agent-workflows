@@ -17,8 +17,10 @@ HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 INLINE_MARKER_RE = re.compile(r"<!-- codex-pr-review-inline:([0-9a-f]{16}) -->")
 INLINE_COMMENT_RE = re.compile(
     r"^\*\*\[(P[0-3])\] (?P<title>.+?)\*\*\n\n"
-    r"`(?P<location>[^`]+)`\n\n"
+    r"`(?P<location>[^`]+)`\n"
+    r"Category: (?P<category>[^\n]+)\n\n"
     r"(?P<body>.*?)\n\n"
+    r"\*\*Suggested fix:\*\*\n(?P<suggested_fix>.*?)\n\n"
     r"Confidence: (?P<confidence>[^\n]+)\n\n"
     r"<!-- codex-pr-review-inline:(?P<fingerprint>[0-9a-f]{16}) -->\s*$",
     re.DOTALL,
@@ -266,6 +268,63 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
     if not 0 <= overall_confidence_score <= 1:
         raise ValueError("overall_confidence_score must be between 0 and 1.")
 
+    # Validate and normalize file_coverage
+    file_coverage = payload.get("file_coverage", [])
+    if not isinstance(file_coverage, list):
+        file_coverage = []
+    normalized_file_coverage: list[dict[str, Any]] = []
+    for idx, fc in enumerate(file_coverage):
+        if not isinstance(fc, dict):
+            continue
+        fc_path = _coerce_text(fc.get("path"), field_name=f"file_coverage[{idx}].path")
+        categories_checked = fc.get("categories_checked", [])
+        if not isinstance(categories_checked, list):
+            categories_checked = []
+        valid_categories = {"security", "correctness", "performance", "maintainability", "contract", "integration"}
+        categories_checked = [c for c in categories_checked if c in valid_categories]
+        findings_count = _coerce_int(fc.get("findings_count", 0), field_name=f"file_coverage[{idx}].findings_count")
+        context_lines_read = _coerce_int(fc.get("context_lines_read", 0), field_name=f"file_coverage[{idx}].context_lines_read")
+        fc_confidence = _coerce_float(fc.get("confidence", 0.5), field_name=f"file_coverage[{idx}].confidence")
+        normalized_file_coverage.append({
+            "path": fc_path,
+            "categories_checked": categories_checked,
+            "findings_count": findings_count,
+            "context_lines_read": context_lines_read,
+            "confidence": round(fc_confidence, 4),
+        })
+
+    # Validate sweep_complete
+    sweep_complete = payload.get("sweep_complete", False)
+    if not isinstance(sweep_complete, bool):
+        sweep_complete = False
+
+    # Validate and normalize sweep_reflection
+    sweep_reflection = payload.get("sweep_reflection", {})
+    if not isinstance(sweep_reflection, dict):
+        sweep_reflection = {}
+    zero_finding_files = sweep_reflection.get("zero_finding_files_reexamined", [])
+    if not isinstance(zero_finding_files, list):
+        zero_finding_files = []
+    additional_findings = _coerce_int(
+        sweep_reflection.get("additional_findings_from_reflection", 0),
+        field_name="sweep_reflection.additional_findings_from_reflection"
+    )
+    confidence_adj = _coerce_float(
+        sweep_reflection.get("confidence_adjustment", 0),
+        field_name="sweep_reflection.confidence_adjustment"
+    )
+    reflection_notes = _coerce_text(
+        sweep_reflection.get("notes", ""),
+        field_name="sweep_reflection.notes"
+    ) if sweep_reflection.get("notes") else ""
+    normalized_sweep_reflection = {
+        "zero_finding_files_reexamined": zero_finding_files,
+        "additional_findings_from_reflection": additional_findings,
+        "confidence_adjustment": round(confidence_adj, 4),
+        "notes": reflection_notes,
+    }
+
+    valid_categories = {"security", "correctness", "performance", "maintainability", "contract", "integration"}
     normalized_findings: list[dict[str, Any]] = []
     seen_fingerprints: set[str] = set()
     seen_previous_fingerprints: set[str] = set()
@@ -279,6 +338,23 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
         priority = _coerce_int(raw_finding.get("priority"), field_name=f"finding[{index}].priority")
         if priority not in PRIORITY_LABELS:
             raise ValueError(f"finding[{index}].priority must be between 0 and 3.")
+
+        # Handle suggested_fix (required field)
+        suggested_fix = raw_finding.get("suggested_fix")
+        if suggested_fix is not None:
+            suggested_fix = _coerce_text(suggested_fix, field_name=f"finding[{index}].suggested_fix")
+        else:
+            # Provide a placeholder if missing (should not happen with new prompt)
+            suggested_fix = "Review the code and apply appropriate fix based on the issue description."
+
+        # Handle category (required field)
+        category = raw_finding.get("category")
+        if category is not None:
+            category = _coerce_text(category, field_name=f"finding[{index}].category")
+            if category not in valid_categories:
+                category = "correctness"  # Default fallback
+        else:
+            category = "correctness"  # Default fallback
 
         confidence_score = _coerce_float(
             raw_finding.get("confidence_score"),
@@ -322,6 +398,8 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
                 "priority_label": PRIORITY_LABELS[priority],
                 "title": title,
                 "body": body,
+                "suggested_fix": suggested_fix,
+                "category": category,
                 "path": path,
                 "start_line": start_line,
                 "end_line": end_line,
@@ -347,6 +425,9 @@ def normalize_review_payload(payload: Any) -> dict[str, Any]:
         "overall_explanation": overall_explanation,
         "overall_confidence_score": round(overall_confidence_score, 4),
         "findings": normalized_findings,
+        "file_coverage": normalized_file_coverage,
+        "sweep_complete": sweep_complete,
+        "sweep_reflection": normalized_sweep_reflection,
     }
 
 
@@ -372,6 +453,8 @@ def parse_managed_inline_comment(comment_body: str) -> dict[str, Any]:
     path, start_line, end_line = _parse_location(match.group("location"))
     title = _coerce_text(match.group("title"), field_name="finding.title")
     body = _coerce_text(match.group("body"), field_name="finding.body")
+    category = _coerce_text(match.group("category"), field_name="finding.category")
+    suggested_fix = _coerce_text(match.group("suggested_fix"), field_name="finding.suggested_fix")
     confidence_score = _coerce_float(
         match.group("confidence"),
         field_name="finding.confidence_score",
@@ -389,6 +472,8 @@ def parse_managed_inline_comment(comment_body: str) -> dict[str, Any]:
         "priority_label": priority_label,
         "title": title,
         "body": body,
+        "suggested_fix": suggested_fix,
+        "category": category,
         "path": path,
         "start_line": start_line,
         "end_line": end_line,
@@ -444,42 +529,105 @@ def build_review_prompt(
     normalized_repository_owner = str(repository_owner or "").strip()
 
     lines = [
-        "You are acting as a reviewer for a proposed code change made by another engineer.",
+        "You are an adversarial code reviewer. Your goal is to find issues that a typical reviewer would miss, could cause production failures, or would be difficult to spot without careful reading.",
         "",
         f"Review only the pull request changes introduced by comparing `origin/{normalized_review_base}...HEAD`.",
         "The repository root is the current working directory.",
         "",
-        "Primary goal: produce an exhaustive blocker-first review of this pull request on the current HEAD.",
-        "Review every changed file and every changed diff hunk before returning.",
-        "Treat revalidation of previously open findings as one checklist item, not the end of the review.",
-        "Do not stop after finding the first one or two issues.",
-        "Before returning, check whether additional P0 or P1 issues exist elsewhere in the diff.",
-        "After the blocker sweep is complete, include any clear P2/P3 findings you discovered.",
+        "## Multi-Pass Review Methodology",
         "",
-        "Focus on actionable issues that affect correctness, performance, security, maintainability, or developer experience.",
-        "Flag only issues introduced by this pull request.",
-        "Do not report style nits, speculative concerns, or pre-existing issues.",
-        "Prioritize complete coverage of the changed files list and unified diff over deep investigation of a single issue.",
-        "Inspect unchanged files only when required to confirm a concrete issue, and read the smallest necessary context.",
-        "Use the available tools to inspect the repository, changed files, and diff before deciding whether to raise a finding.",
+        "You must perform a systematic multi-pass review. Do NOT stop after finding initial issues. Continue until you satisfy all explicit stopping criteria.",
         "",
-        "Return JSON that matches the provided schema and nothing else.",
+        "### Pass 1: File Inventory and Risk Assessment",
+        "Read the changed files list and diff to identify:",
+        "- Which files are security-sensitive (auth, secrets, permissions, input handling)",
+        "- Which files are correctness-critical (core logic, state management, error handling)",
+        "- Which files have cross-file dependencies",
+        "- Which files have the largest/most complex changes",
         "",
-        "Output requirements:",
-        "- Use repo-relative POSIX paths in the `path` field.",
-        "- Use exact HEAD-side line numbers from the changed diff.",
-        "- Set `priority` to 0 for the most severe blocking issues and 3 for the least severe findings.",
-        "- Keep `title` short and direct.",
-        "- Make `body` concise, specific, and actionable.",
-        "- When a currently valid finding matches a previously open finding, copy its `previous_fingerprint` exactly into the result.",
-        "- Set `previous_fingerprint` to `null` for genuinely new findings.",
-        "- Revalidate previously open findings, then continue the full blocker-first sweep across the diff.",
-        "- Return all actionable P0/P1 findings you can substantiate from the current HEAD, not just a sample.",
-        "- Only finish after checking the rest of the changed files for additional blocking issues.",
-        "- Include P2/P3 findings when they are clear and actionable, but do not let them crowd out the blocker sweep.",
-        "- Return only findings that are still valid on the current HEAD. Omit previously open findings that are now resolved.",
-        "- If there are no actionable findings, return an empty `findings` array.",
-        "- Use `overall_correctness` of `patch is correct` only when the patch is safe to merge as-is.",
+        "### Pass 2: Category Sweep Per File",
+        "For EACH changed file, systematically check ALL six categories:",
+        "",
+        "1. **security**: injection (SQL, XSS, command), auth bypasses, secrets exposure, permission gaps, unsafe deserialization, path traversal, insecure defaults",
+        "2. **correctness**: logic errors, edge cases, null handling, race conditions, dead code, missing error handling, incorrect return values, state corruption",
+        "3. **performance**: N+1 queries, unnecessary loops, memory leaks, blocking calls in async contexts, inefficient algorithms, missing caching",
+        "4. **maintainability**: misleading names, duplicated logic, excessive complexity, missing documentation for public APIs, inconsistent patterns",
+        "5. **contract**: breaking API changes, missing version bumps for public interfaces, deprecated usage without migration path, signature changes",
+        "6. **integration**: cross-file inconsistencies, missing dependency updates, configuration mismatches, breaking downstream consumers",
+        "",
+        "For each category in each file:",
+        "- Read the full diff hunk",
+        "- Read at least 50 lines of surrounding context (before and after the hunk)",
+        "- Check for issues specific to that category",
+        "- Record `categories_checked` in file_coverage",
+        "",
+        "DO NOT skip any category. Even if a file seems low-risk, check all six categories explicitly.",
+        "",
+        "### Pass 3: Cross-Cutting Analysis",
+        "After the file-level sweep:",
+        "- Check for issues spanning multiple files",
+        "- Verify consistency across related changes",
+        "- Identify breaking changes that affect other modules",
+        "- Check integration impact (APIs, configs, dependencies)",
+        "",
+        "### Pass 4: Reflection and Verification",
+        "After completing the initial sweep, perform reflection:",
+        "",
+        "1. **Re-examine zero-finding files**: Files with no findings deserve extra scrutiny. Re-read them and verify the absence is genuine.",
+        "2. **Re-examine sparse categories**: If a category has zero findings across all files, check whether you truly checked that category or just assumed it was fine.",
+        "3. **Challenge your findings**: Are any findings overstated? Are they real issues or nitpicks? Remove or downgrade hallucinated or trivial findings.",
+        "4. **Final sweep**: Before returning, ask yourself: 'What issue might a typical reviewer miss here?' Check those areas again.",
+        "",
+        "## Explicit Stopping Criteria",
+        "",
+        "You may only set `sweep_complete: true` if ALL criteria are satisfied:",
+        "",
+        "1. Every changed file has been examined for all six categories (recorded in `file_coverage`)",
+        "2. Each file has at least 50 lines of context read beyond the diff hunk",
+        "3. Zero-finding files have been re-examined during reflection",
+        "4. Cross-cutting issues have been checked",
+        "5. You can confidently state: 'I have exhausted all reasonable search paths and found no additional issues'",
+        "",
+        "If ANY criterion is unsatisfied, set `sweep_complete: false` and CONTINUE the review.",
+        "",
+        "## Finding Requirements",
+        "",
+        "For each finding:",
+        "- `title`: Short, specific description (max 120 chars)",
+        "- `body`: Detailed explanation of the issue, why it matters, and evidence from the code",
+        "- `suggested_fix`: Concrete, actionable fix with code snippet or specific change recommendation. REQUIRED for every finding.",
+        "- `category`: One of security, correctness, performance, maintainability, contract, integration",
+        "- `priority`: 0 (critical blocker), 1 (blocker), 2 (should fix), 3 (minor)",
+        "- `confidence_score`: 0-1, how confident you are this is a real issue",
+        "- `path`: Repo-relative POSIX path",
+        "- `start_line`, `end_line`: Exact HEAD-side line numbers from the diff",
+        "",
+        "For `suggested_fix`:",
+        "- Provide specific code changes: 'Replace X with Y' or 'Add Z before line N'",
+        "- Include a brief code snippet showing the fix when applicable",
+        "- Explain why this fix resolves the issue",
+        "- Avoid vague suggestions like 'refactor this' or 'improve error handling'",
+        "",
+        "## Output Format",
+        "",
+        "Return JSON matching the provided schema:",
+        "- `findings`: Array of findings with suggested_fix for each",
+        "- `file_coverage`: Per-file checklist showing categories_checked, findings_count, context_lines_read, confidence",
+        "- `sweep_complete`: boolean indicating all criteria satisfied",
+        "- `sweep_reflection`: Object documenting reflection pass outcomes",
+        "- `overall_correctness`: 'patch is correct' or 'patch is incorrect'",
+        "- `overall_explanation`: Summary of review findings and confidence",
+        "- `overall_confidence_score`: 0-1 confidence in the review completeness",
+        "",
+        "## Important Constraints",
+        "",
+        "- Flag ONLY issues introduced by this pull request (not pre-existing)",
+        "- Do NOT report style nits, speculative concerns, or trivial findings",
+        "- When a finding matches a previously open finding, copy `previous_fingerprint` exactly",
+        "- Set `previous_fingerprint: null` for genuinely new findings",
+        "- Prioritize exhaustive coverage over deep investigation of a single issue",
+        "- Use `overall_correctness: 'patch is correct'` ONLY when the patch is safe to merge as-is",
+        "- If no actionable findings exist, return empty `findings` array but still complete all passes",
     ]
 
     if normalized_repository_owner:
@@ -748,12 +896,18 @@ def build_inline_comment_body(finding: dict[str, Any]) -> str:
         finding["start_line"],
         finding["end_line"],
     )
+    category = finding.get("category", "correctness")
+    suggested_fix = finding.get("suggested_fix", "")
     lines = [
         f"**[{finding['priority_label']}] {finding['title']}**",
         "",
         f"`{location}`",
+        f"Category: {category}",
         "",
         finding["body"],
+        "",
+        "**Suggested fix:**",
+        suggested_fix,
         "",
         f"Confidence: {format_confidence(finding['confidence_score'])}",
         "",
@@ -859,11 +1013,26 @@ def render_summary_body(
         verdict = "n/a"
         verdict_confidence = "n/a"
         overall_explanation = state["parse_error"] or "Structured review output could not be parsed."
+        sweep_complete = False
+        sweep_coverage = "n/a"
     else:
         structured_output_status = "ok"
         verdict = state["overall_correctness"]
         verdict_confidence = format_confidence(state["overall_confidence_score"])
         overall_explanation = state["overall_explanation"]
+        sweep_complete = state.get("sweep_complete", False)
+        file_coverage = state.get("file_coverage", [])
+        files_covered = len(file_coverage)
+        files_with_all_categories = sum(
+            1 for fc in file_coverage
+            if len(fc.get("categories_checked", [])) >= 6
+        )
+        total_context_read = sum(fc.get("context_lines_read", 0) for fc in file_coverage)
+        sweep_coverage = f"{files_with_all_categories}/{files_covered} files with full category sweep, {total_context_read} lines context read"
+
+    sweep_reflection = state.get("sweep_reflection", {})
+    reflection_notes = sweep_reflection.get("notes", "") if isinstance(sweep_reflection, dict) else ""
+    additional_from_reflection = sweep_reflection.get("additional_findings_from_reflection", 0) if isinstance(sweep_reflection, dict) else 0
 
     summary_findings = build_summary_findings(state["findings"])
 
@@ -878,6 +1047,8 @@ def render_summary_body(
         f"Structured output: `{structured_output_status}`",
         f"Verdict: `{verdict}`",
         f"Verdict confidence: `{verdict_confidence}`",
+        f"Sweep complete: `{'yes' if sweep_complete else 'no (may have missed issues)'}`",
+        f"Coverage: `{sweep_coverage}`",
         f"Blocking findings: P0 `{counts['P0']}` | P1 `{counts['P1']}`",
         f"Other findings: P2 `{counts['P2']}` | P3 `{counts['P3']}`",
         (
@@ -897,13 +1068,26 @@ def render_summary_body(
         "",
         "**Overall explanation**",
         overall_explanation,
+    ]
+
+    if additional_from_reflection > 0:
+        body.extend([
+            "",
+            f"**Reflection pass**: Found `{additional_from_reflection}` additional issue(s) after re-examination.",
+        ])
+        if reflection_notes:
+            body.append(reflection_notes)
+
+    body.extend([
         "",
         "**Top findings**",
         summary_findings,
-    ]
+    ])
 
     if total_findings == 0 and not state["parse_failed"]:
         body.extend(["", "No actionable findings were returned."])
+        if not sweep_complete:
+            body.append("**Warning**: Sweep was not completed. Issues may have been missed.")
 
     body.extend(
         [

@@ -146,6 +146,21 @@ cat > "$schema_path" <<'JSON'
             "type": "string",
             "minLength": 1
           },
+          "suggested_fix": {
+            "type": "string",
+            "minLength": 1
+          },
+          "category": {
+            "type": "string",
+            "enum": [
+              "security",
+              "correctness",
+              "performance",
+              "maintainability",
+              "contract",
+              "integration"
+            ]
+          },
           "confidence_score": {
             "type": "number",
             "minimum": 0,
@@ -178,6 +193,8 @@ cat > "$schema_path" <<'JSON'
         "required": [
           "title",
           "body",
+          "suggested_fix",
+          "category",
           "confidence_score",
           "priority",
           "path",
@@ -187,6 +204,86 @@ cat > "$schema_path" <<'JSON'
         ],
         "additionalProperties": false
       }
+    },
+    "file_coverage": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1
+          },
+          "categories_checked": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "enum": [
+                "security",
+                "correctness",
+                "performance",
+                "maintainability",
+                "contract",
+                "integration"
+              ]
+            }
+          },
+          "findings_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "context_lines_read": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          }
+        },
+        "required": [
+          "path",
+          "categories_checked",
+          "findings_count",
+          "context_lines_read",
+          "confidence"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "sweep_complete": {
+      "type": "boolean"
+    },
+    "sweep_reflection": {
+      "type": "object",
+      "properties": {
+        "zero_finding_files_reexamined": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "additional_findings_from_reflection": {
+          "type": "integer",
+            "minimum": 0
+        },
+        "confidence_adjustment": {
+          "type": "number",
+            "minimum": -1,
+            "maximum": 1
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "zero_finding_files_reexamined",
+        "additional_findings_from_reflection",
+        "confidence_adjustment",
+        "notes"
+      ],
+      "additionalProperties": false
     },
     "overall_correctness": {
       "type": "string",
@@ -207,6 +304,9 @@ cat > "$schema_path" <<'JSON'
   },
   "required": [
     "findings",
+    "file_coverage",
+    "sweep_complete",
+    "sweep_reflection",
     "overall_correctness",
     "overall_explanation",
     "overall_confidence_score"
