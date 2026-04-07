@@ -15,12 +15,24 @@ PRIORITY_LABELS = {0: "P0", 1: "P1", 2: "P2", 3: "P3"}
 REVERSE_PRIORITY_LABELS = {label: priority for priority, label in PRIORITY_LABELS.items()}
 HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 INLINE_MARKER_RE = re.compile(r"<!-- codex-pr-review-inline:([0-9a-f]{16}) -->")
+
+# New format with category and suggested_fix
 INLINE_COMMENT_RE = re.compile(
     r"^\*\*\[(P[0-3])\] (?P<title>.+?)\*\*\n\n"
     r"`(?P<location>[^`]+)`\n"
     r"Category: (?P<category>[^\n]+)\n\n"
     r"(?P<body>.*?)\n\n"
     r"\*\*Suggested fix:\*\*\n(?P<suggested_fix>.*?)\n\n"
+    r"Confidence: (?P<confidence>[^\n]+)\n\n"
+    r"<!-- codex-pr-review-inline:(?P<fingerprint>[0-9a-f]{16}) -->\s*$",
+    re.DOTALL,
+)
+
+# Old format without category and suggested_fix (for backward compatibility)
+INLINE_COMMENT_RE_OLD = re.compile(
+    r"^\*\*\[(P[0-3])\] (?P<title>.+?)\*\*\n\n"
+    r"`(?P<location>[^`]+)`\n\n"
+    r"(?P<body>.*?)\n\n"
     r"Confidence: (?P<confidence>[^\n]+)\n\n"
     r"<!-- codex-pr-review-inline:(?P<fingerprint>[0-9a-f]{16}) -->\s*$",
     re.DOTALL,
@@ -442,44 +454,81 @@ def parse_managed_inline_comment(comment_body: str) -> dict[str, Any]:
     if not isinstance(comment_body, str):
         raise ValueError("Managed inline comment body must be a string.")
 
+    # Try new format first (with category and suggested_fix)
     match = INLINE_COMMENT_RE.match(comment_body.strip())
-    if not match:
-        raise ValueError("Managed inline comment body does not match the expected format.")
+    if match:
+        priority, priority_label = _parse_priority_label(
+            match.group(1),
+            field_name="finding.priority_label",
+        )
+        path, start_line, end_line = _parse_location(match.group("location"))
+        title = _coerce_text(match.group("title"), field_name="finding.title")
+        body = _coerce_text(match.group("body"), field_name="finding.body")
+        category = _coerce_text(match.group("category"), field_name="finding.category")
+        suggested_fix = _coerce_text(match.group("suggested_fix"), field_name="finding.suggested_fix")
+        confidence_score = _coerce_float(
+            match.group("confidence"),
+            field_name="finding.confidence_score",
+        )
+        if not 0 <= confidence_score <= 1:
+            raise ValueError("finding.confidence_score must be between 0 and 1.")
 
-    priority, priority_label = _parse_priority_label(
-        match.group(1),
-        field_name="finding.priority_label",
-    )
-    path, start_line, end_line = _parse_location(match.group("location"))
-    title = _coerce_text(match.group("title"), field_name="finding.title")
-    body = _coerce_text(match.group("body"), field_name="finding.body")
-    category = _coerce_text(match.group("category"), field_name="finding.category")
-    suggested_fix = _coerce_text(match.group("suggested_fix"), field_name="finding.suggested_fix")
-    confidence_score = _coerce_float(
-        match.group("confidence"),
-        field_name="finding.confidence_score",
-    )
-    if not 0 <= confidence_score <= 1:
-        raise ValueError("finding.confidence_score must be between 0 and 1.")
+        fingerprint = _coerce_text(
+            match.group("fingerprint"),
+            field_name="finding.fingerprint",
+        )
 
-    fingerprint = _coerce_text(
-        match.group("fingerprint"),
-        field_name="finding.fingerprint",
-    )
+        return {
+            "priority": priority,
+            "priority_label": priority_label,
+            "title": title,
+            "body": body,
+            "suggested_fix": suggested_fix,
+            "category": category,
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "confidence_score": round(confidence_score, 4),
+            "fingerprint": fingerprint,
+        }
 
-    return {
-        "priority": priority,
-        "priority_label": priority_label,
-        "title": title,
-        "body": body,
-        "suggested_fix": suggested_fix,
-        "category": category,
-        "path": path,
-        "start_line": start_line,
-        "end_line": end_line,
-        "confidence_score": round(confidence_score, 4),
-        "fingerprint": fingerprint,
-    }
+    # Fall back to old format (without category and suggested_fix)
+    match = INLINE_COMMENT_RE_OLD.match(comment_body.strip())
+    if match:
+        priority, priority_label = _parse_priority_label(
+            match.group(1),
+            field_name="finding.priority_label",
+        )
+        path, start_line, end_line = _parse_location(match.group("location"))
+        title = _coerce_text(match.group("title"), field_name="finding.title")
+        body = _coerce_text(match.group("body"), field_name="finding.body")
+        confidence_score = _coerce_float(
+            match.group("confidence"),
+            field_name="finding.confidence_score",
+        )
+        if not 0 <= confidence_score <= 1:
+            raise ValueError("finding.confidence_score must be between 0 and 1.")
+
+        fingerprint = _coerce_text(
+            match.group("fingerprint"),
+            field_name="finding.fingerprint",
+        )
+
+        return {
+            "priority": priority,
+            "priority_label": priority_label,
+            "title": title,
+            "body": body,
+            "suggested_fix": "",  # Empty for old format
+            "category": "correctness",  # Default for old format
+            "path": path,
+            "start_line": start_line,
+            "end_line": end_line,
+            "confidence_score": round(confidence_score, 4),
+            "fingerprint": fingerprint,
+        }
+
+    raise ValueError("Managed inline comment body does not match the expected format.")
 
 
 def build_open_prior_findings(managed_threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
