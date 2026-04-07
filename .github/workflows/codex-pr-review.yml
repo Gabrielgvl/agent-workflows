@@ -437,25 +437,37 @@ jobs:
           set -euo pipefail
           python3 "${WORKFLOW_HELPERS_DIR}/publish_codex_review.py"
 
-      - name: Fail if Codex command failed
-        if: ${{ steps.review.outputs.codex_exit_code != '0' }}
+      - name: Fail if Codex command failed (unless override active)
+        if: ${{ steps.review.outputs.codex_exit_code != '0' && steps.override.outputs.active != '1' }}
         shell: bash
         run: |
           echo "::error::codex structured review command failed (exit code ${{ steps.review.outputs.codex_exit_code }})."
           exit 1
 
-      - name: Fail if structured review output is invalid
-        if: ${{ steps.state.outputs.parse_failed == '1' }}
+      - name: Warn if Codex command failed with override active
+        if: ${{ steps.review.outputs.codex_exit_code != '0' && steps.override.outputs.active == '1' }}
+        shell: bash
+        run: |
+          echo "::warning::codex structured review command failed (exit code ${{ steps.review.outputs.codex_exit_code }}), but admin override is active - allowing merge."
+
+      - name: Fail if structured review output is invalid (unless override active)
+        if: ${{ steps.state.outputs.parse_failed == '1' && steps.override.outputs.active != '1' }}
         shell: bash
         run: |
           echo "::error::Failed to validate the structured Codex review output."
           exit 1
 
+      - name: Warn if structured review output is invalid with override active
+        if: ${{ steps.state.outputs.parse_failed == '1' && steps.override.outputs.active == '1' }}
+        shell: bash
+        run: |
+          echo "::warning::Failed to validate the structured Codex review output, but admin override is active - allowing merge."
+
       - name: Fail on P0 findings
         if: ${{ steps.state.outputs.p0_count != '0' }}
         shell: bash
         run: |
-          echo "::error::Blocking Codex findings detected (P0=${{ steps.state.outputs.p0_count }})."
+          echo "::error::Blocking Codex findings detected (P0=${{ steps.state.outputs.p0_count }}). Override does not apply to P0 findings."
           exit 1
 
       - name: Fail on P1 findings without admin override
