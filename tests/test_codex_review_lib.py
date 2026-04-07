@@ -137,6 +137,34 @@ class ManagedInlineCommentParsingTests(unittest.TestCase):
         self.assertEqual(finding["category"], "correctness")
         self.assertEqual(finding["suggested_fix"], "Add a null check before cleanup: if result is not None: cleanup()")
 
+    def test_parses_old_format_inline_comment_for_backward_compatibility(self) -> None:
+        """Test that old format comments (without category/suggested_fix) are still parseable."""
+        body = "\n".join(
+            [
+                "**[P1] Missing cleanup guard**",
+                "",
+                "`src/app.py:23-24`",
+                "",
+                "The cleanup path can dereference a null result.",
+                "",
+                "Confidence: 0.72",
+                "",
+                "<!-- codex-pr-review-inline:bbbbbbbbbbbbbbbb -->",
+            ]
+        )
+
+        finding = lib.parse_managed_inline_comment(body)
+
+        self.assertEqual(finding["priority"], 1)
+        self.assertEqual(finding["priority_label"], "P1")
+        self.assertEqual(finding["path"], "src/app.py")
+        self.assertEqual(finding["start_line"], 23)
+        self.assertEqual(finding["end_line"], 24)
+        self.assertEqual(finding["fingerprint"], "bbbbbbbbbbbbbbbb")
+        # Old format gets defaults
+        self.assertEqual(finding["category"], "correctness")
+        self.assertEqual(finding["suggested_fix"], "")
+
 
 class InlinePlacementTests(unittest.TestCase):
     def test_classifies_placeable_unplaced_and_truncated_findings(self) -> None:
