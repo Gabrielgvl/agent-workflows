@@ -16,6 +16,8 @@ review_timeout_seconds="${CODEX_REVIEW_TIMEOUT_SECONDS:-900}"
 review_reasoning_effort="${CODEX_REVIEW_REASONING_EFFORT:-medium}"
 review_reasoning_summary="${CODEX_REVIEW_REASONING_SUMMARY:-}"
 review_verbosity="${CODEX_REVIEW_VERBOSITY:-}"
+review_mode="${CODEX_REVIEW_MODE:-discovery}"
+review_previous_head_sha="${CODEX_REVIEW_PREVIOUS_HEAD_SHA:-}"
 auth_json="${CODEX_AUTH_JSON:-}"
 runner_temp_root="${RUNNER_TEMP:-$PWD/.tmp/codex-review}"
 timeout_bin=""
@@ -114,19 +116,179 @@ fi
 
 head_sha="$(git rev-parse HEAD)"
 base_sha="$(git rev-parse "$review_base_ref")"
-if ! merge_base="$(git merge-base "$head_sha" "$base_sha")"; then
-  cat > "$review_log_path" <<EOF
-ERROR: unable to compute git merge-base between HEAD (${head_sha}) and ${review_base_ref} (${base_sha}).
-Ensure the caller workflow checks out the pull request head SHA and fetches the full base branch before invoking codex-pr-review.
-EOF
+
+# Validate review_mode
+valid_modes="discovery gate same_sha"
+if ! echo "$valid_modes" | grep -qw "$review_mode"; then
+  printf 'ERROR: Invalid CODEX_REVIEW_MODE: %s. Allowed: %s\n' "$review_mode" "$valid_modes" > "$review_log_path"
   cat "$review_log_path"
   exit 2
 fi
 
-git diff --name-status --find-renames "${review_base_ref}...HEAD" > "$changed_files_path"
-git diff --relative --find-renames --unified=5 "${review_base_ref}...HEAD" > "$diff_path"
+# Handle same_sha mode: skip codex exec, synthesize output from prior open findings
+if [[ "$review_mode" == "same_sha" ]]; then
+  log_info "Review mode: same_sha (skipping codex exec, synthesizing from prior open findings)"
+
+  prior_open_findings_count="$(python3 - "$prior_open_findings_path" "$raw_output_path" <<'SYNTHESIZE_PY'
+import json
+import pathlib
+import sys
+
+prior_path = pathlib.Path(sys.argv[1])
+output_path = pathlib.Path(sys.argv[2])
+
+
+def to_text(value: object, default: str) -> str:
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    return default
+
+
+def to_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed
+
+
+def to_float(value: object, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed
+
+
+open_findings: list[dict[str, object]] = []
+if prior_path.is_file():
+    payload = json.loads(prior_path.read_text(encoding="utf-8"))
+    raw_open_findings = payload.get("open_findings")
+    if isinstance(raw_open_findings, list):
+        open_findings = [item for item in raw_open_findings if isinstance(item, dict)]
+
+synthesized_findings: list[dict[str, object]] = []
+for finding in open_findings:
+    start_line = max(1, to_int(finding.get("start_line"), 1))
+    end_line = max(start_line, to_int(finding.get("end_line"), start_line))
+    priority = to_int(finding.get("priority"), 2)
+    if priority < 0 or priority > 3:
+        priority = 2
+
+    confidence_score = to_float(finding.get("confidence_score"), 0.5)
+    if confidence_score < 0 or confidence_score > 1:
+        confidence_score = 0.5
+
+    previous_fingerprint = finding.get("previous_fingerprint")
+    if isinstance(previous_fingerprint, str):
+        previous_fingerprint = previous_fingerprint.strip() or None
+    else:
+        previous_fingerprint = None
+
+    synthesized_findings.append(
+        {
+            "title": to_text(finding.get("title"), "Prior open finding"),
+            "body": to_text(
+                finding.get("body"),
+                "A previously reported finding remains open and must be revalidated.",
+            ),
+            "suggested_fix": "Review and address the prior open finding.",
+            "category": "correctness",
+            "confidence_score": confidence_score,
+            "priority": priority,
+            "path": to_text(finding.get("path"), "unknown"),
+            "start_line": start_line,
+            "end_line": end_line,
+            "previous_fingerprint": previous_fingerprint,
+        }
+    )
+
+output = {
+    "findings": synthesized_findings,
+    "file_coverage": [],
+    "sweep_complete": True,
+    "sweep_reflection": {
+        "zero_finding_files_reexamined": [],
+        "additional_findings_from_reflection": 0,
+        "confidence_adjustment": 0,
+        "notes": "Synthesized from prior open findings in same_sha mode.",
+    },
+    "overall_correctness": "patch is incorrect" if synthesized_findings else "patch is correct",
+    "overall_explanation": (
+        "Prior open findings still require attention."
+        if synthesized_findings
+        else "No prior open findings remain."
+    ),
+    "overall_confidence_score": 0.8 if synthesized_findings else 1.0,
+}
+
+output_path.write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+print(str(len(open_findings)))
+SYNTHESIZE_PY
+)"
+
+  log_info "Prior open findings count: ${prior_open_findings_count}"
+  log_info "Synthesized codex-review.json with ${prior_open_findings_count} findings from prior open findings"
+
+  # Generate minimal diff for compatibility
+  git diff --name-status --find-renames "${review_base_ref}...HEAD" > "$changed_files_path"
+  git diff --relative --find-renames --unified=5 "${review_base_ref}...HEAD" > "$diff_path"
+  changed_file_count="$(wc -l < "$changed_files_path" | tr -d '[:space:]')"
+  log_info "Prepared review context for ${changed_file_count} changed files (same_sha mode)"
+
+  exit 0
+fi
+
+# Compute diff base based on mode
+diff_base_ref=""
+diff_base_sha=""
+if [[ "$review_mode" == "gate" && -n "$review_previous_head_sha" ]]; then
+  # Gate mode: try to use previous_head_sha as diff base
+  if git rev-parse --verify "$review_previous_head_sha" >/dev/null 2>&1; then
+    diff_base_sha="$review_previous_head_sha"
+    log_info "Review mode: gate (diff base: previous_head_sha=${review_previous_head_sha})"
+  else
+    log_info "Review mode: gate (previous_head_sha invalid, falling back to origin/${review_base})"
+    diff_base_ref="$review_base_ref"
+    diff_base_sha="$base_sha"
+  fi
+else
+  # Discovery mode or gate mode without valid previous_head_sha
+  diff_base_ref="$review_base_ref"
+  diff_base_sha="$base_sha"
+  log_info "Review mode: ${review_mode} (diff base: origin/${review_base})"
+fi
+
+if [[ -n "$diff_base_ref" ]]; then
+  if ! merge_base="$(git merge-base "$head_sha" "$diff_base_sha")"; then
+    cat > "$review_log_path" <<EOF
+ERROR: unable to compute git merge-base between HEAD (${head_sha}) and ${diff_base_ref} (${diff_base_sha}).
+Ensure the caller workflow checks out the pull request head SHA and fetches the full base branch before invoking codex-pr-review.
+EOF
+    cat "$review_log_path"
+    exit 2
+  fi
+else
+  if ! merge_base="$(git merge-base "$head_sha" "$diff_base_sha")"; then
+    cat > "$review_log_path" <<EOF
+ERROR: unable to compute git merge-base between HEAD (${head_sha}) and ${diff_base_sha}.
+EOF
+    cat "$review_log_path"
+    exit 2
+  fi
+fi
+
+if [[ -n "$diff_base_ref" ]]; then
+  git diff --name-status --find-renames "${diff_base_ref}...HEAD" > "$changed_files_path"
+  git diff --relative --find-renames --unified=5 "${diff_base_ref}...HEAD" > "$diff_path"
+else
+  git diff --name-status --find-renames "${diff_base_sha}...HEAD" > "$changed_files_path"
+  git diff --relative --find-renames --unified=5 "${diff_base_sha}...HEAD" > "$diff_path"
+fi
 changed_file_count="$(wc -l < "$changed_files_path" | tr -d '[:space:]')"
-log_info "Prepared review context for ${changed_file_count} changed files against origin/${review_base}."
+log_info "Prepared review context for ${changed_file_count} changed files against ${diff_base_ref:-$diff_base_sha}."
 
 cat > "$schema_path" <<'JSON'
 {
@@ -315,7 +477,7 @@ cat > "$schema_path" <<'JSON'
 }
 JSON
 
-prior_open_findings_count="$(python3 - "$workflow_helpers_dir/codex_review_lib.py" "$prompt_path" "$review_base" "$base_sha" "$merge_base" "$head_sha" "$(basename "$changed_files_path")" "$(basename "$diff_path")" "$repository_owner" "$prior_open_findings_path" <<'PY'
+prior_open_findings_count="$(python3 - "$workflow_helpers_dir/codex_review_lib.py" "$prompt_path" "$review_base" "$diff_base_sha" "$merge_base" "$head_sha" "$(basename "$changed_files_path")" "$(basename "$diff_path")" "$repository_owner" "$prior_open_findings_path" "$review_mode" "$review_previous_head_sha" <<'PY'
 import importlib.util
 import json
 import pathlib
@@ -331,6 +493,8 @@ changed_files_filename = sys.argv[7]
 diff_filename = sys.argv[8]
 repository_owner = sys.argv[9]
 prior_path = pathlib.Path(sys.argv[10])
+review_mode_arg = sys.argv[11] if len(sys.argv) > 11 else "discovery"
+previous_head_sha_arg = sys.argv[12] if len(sys.argv) > 12 else ""
 
 spec = importlib.util.spec_from_file_location("codex_review_lib", module_path)
 module = importlib.util.module_from_spec(spec)
@@ -354,6 +518,8 @@ prompt_path.write_text(
         diff_filename=diff_filename,
         repository_owner=repository_owner,
         prior_open_findings=prior_open_findings,
+        review_mode=review_mode_arg,
+        previous_head_sha=previous_head_sha_arg,
     ),
     encoding="utf-8",
 )

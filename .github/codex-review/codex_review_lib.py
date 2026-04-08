@@ -78,6 +78,16 @@ def _parse_priority_label(value: Any, *, field_name: str) -> tuple[int, str]:
     return REVERSE_PRIORITY_LABELS[label], label
 
 
+def _normalize_title_for_fingerprint(title: str) -> str:
+    """Normalize title for stable fingerprint computation."""
+    # Lowercase, strip whitespace, collapse multiple spaces to single
+    normalized = title.strip().lower()
+    # Remove punctuation that may vary between runs
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    normalized = re.sub(r'\s+', ' ', normalized)
+    return normalized
+
+
 def _compute_fingerprint(
     *,
     priority: int,
@@ -87,11 +97,11 @@ def _compute_fingerprint(
     start_line: int,
     end_line: int,
 ) -> str:
+    """Compute a stable fingerprint from normalized title + path + lines."""
+    # Drop body/priority dependence for stability
     fingerprint_source = json.dumps(
         {
-            "priority": priority,
-            "title": title,
-            "body": body,
+            "title": _normalize_title_for_fingerprint(title),
             "path": path,
             "start_line": start_line,
             "end_line": end_line,
@@ -131,6 +141,41 @@ def _finding_signature(finding: dict[str, Any]) -> tuple[int, str, int, int, str
         int(finding["end_line"]),
         str(finding["title"]).strip().lower(),
     )
+
+
+def _tokenize_title(title: str) -> set[str]:
+    """Extract significant tokens from a title for fuzzy matching."""
+    # Normalize similar to fingerprint normalization
+    normalized = title.strip().lower()
+    normalized = re.sub(r'[^\w\s]', '', normalized)
+    tokens = set(normalized.split())
+    # Filter out very short tokens (likely noise)
+    return {t for t in tokens if len(t) >= 3}
+
+
+def _title_overlap_score(title1: str, title2: str) -> float:
+    """Compute Jaccard-like overlap score between two titles."""
+    tokens1 = _tokenize_title(title1)
+    tokens2 = _tokenize_title(title2)
+    if not tokens1 or not tokens2:
+        return 0.0
+    intersection = tokens1 & tokens2
+    union = tokens1 | tokens2
+    return len(intersection) / len(union) if union else 0.0
+
+
+def _line_distance_tolerance(
+    finding: dict[str, Any],
+    thread_finding: dict[str, Any],
+    tolerance: int = 5,
+) -> bool:
+    """Check if finding lines are within tolerance of thread lines."""
+    f_start = int(finding["start_line"])
+    f_end = int(finding["end_line"])
+    t_start = int(thread_finding["start_line"])
+    t_end = int(thread_finding["end_line"])
+    # Check if ranges overlap or are within tolerance
+    return abs(f_start - t_start) <= tolerance and abs(f_end - t_end) <= tolerance
 
 
 def _format_finding_location(path: str, start_line: int, end_line: int) -> str:
@@ -565,6 +610,8 @@ def build_review_prompt(
     diff_filename: str,
     repository_owner: str = "",
     prior_open_findings: list[dict[str, Any]] | None = None,
+    review_mode: str = "discovery",
+    previous_head_sha: str = "",
 ) -> str:
     normalized_review_base = _coerce_text(review_base, field_name="review_base")
     normalized_base_sha = _coerce_text(base_sha, field_name="base_sha")
@@ -576,13 +623,68 @@ def build_review_prompt(
     )
     normalized_diff = _coerce_text(diff_filename, field_name="diff_filename")
     normalized_repository_owner = str(repository_owner or "").strip()
+    # Validate review_mode
+    valid_modes = {"discovery", "gate", "same_sha"}
+    normalized_review_mode = str(review_mode or "discovery").strip().lower()
+    if normalized_review_mode not in valid_modes:
+        raise ValueError(f"review_mode must be one of: {', '.join(valid_modes)}.")
+    normalized_previous_head_sha = str(previous_head_sha or "").strip()
+
+    # Build mode-specific introduction
+    mode_intro_lines: list[str] = []
+    if normalized_review_mode == "gate" and normalized_previous_head_sha:
+        review_scope_hint = f"`{normalized_previous_head_sha}...HEAD`"
+    elif normalized_review_mode == "same_sha" and normalized_previous_head_sha:
+        review_scope_hint = f"`{normalized_previous_head_sha}...HEAD`"
+    else:
+        review_scope_hint = f"`origin/{normalized_review_base}...HEAD`"
+    if normalized_review_mode == "gate" and normalized_previous_head_sha:
+        mode_intro_lines = [
+            "## Incremental Review Mode (Gate)",
+            "",
+            f"This is an **incremental review** of changes from `{normalized_previous_head_sha}...HEAD`.",
+            "",
+            "Your priorities for this gate mode review are:",
+            "",
+            "1. **P0/P1 regression detection**: Focus on finding blocker-level regressions introduced since the prior review.",
+            "2. **Revalidate prior open findings**: For each prior open finding listed below, determine if it still applies or should be resolved.",
+            "3. **Spot-check new changes**: Briefly scan the incremental diff for obvious blocker issues without exhaustive sweeps.",
+            "",
+            "Gate mode does NOT require exhaustive multi-pass coverage. Focus on blockers and prior findings first.",
+            "",
+        ]
+    elif normalized_review_mode == "same_sha":
+        mode_intro_lines = [
+            "## Same SHA Review Mode",
+            "",
+            "The HEAD SHA matches the prior review. Focus only on revalidating prior open findings.",
+            "",
+            "Your priorities for this same_sha mode review are:",
+            "",
+            "1. **Revalidate prior open findings**: For each prior open finding listed below, determine if it still applies or should be resolved.",
+            "2. **No new exhaustive sweep**: Since there are no new changes, you should not introduce new findings unless you find evidence that prior findings were missed.",
+            "",
+        ]
+    else:
+        # Discovery mode: full exhaustive sweep
+        mode_intro_lines = [
+            "## Discovery Review Mode",
+            "",
+            "This is a **full exhaustive review** with no prior completed runs for this PR.",
+            "",
+            "Perform the complete multi-pass methodology below to find all issues introduced by this PR.",
+            "",
+        ]
 
     lines = [
         "You are an adversarial code reviewer. Your goal is to find issues that a typical reviewer would miss, could cause production failures, or would be difficult to spot without careful reading.",
         "",
-        f"Review only the pull request changes introduced by comparing `origin/{normalized_review_base}...HEAD`.",
+        f"Review only the pull request changes represented by the provided changed-files list and unified diff (scope hint: {review_scope_hint}).",
         "The repository root is the current working directory.",
         "",
+    ]
+    lines.extend(mode_intro_lines)
+    lines.extend([
         "## Multi-Pass Review Methodology",
         "",
         "You must perform a systematic multi-pass review. Do NOT stop after finding initial issues. Continue until you satisfy all explicit stopping criteria.",
@@ -677,7 +779,19 @@ def build_review_prompt(
         "- Prioritize exhaustive coverage over deep investigation of a single issue",
         "- Use `overall_correctness: 'patch is correct'` ONLY when the patch is safe to merge as-is",
         "- If no actionable findings exist, return empty `findings` array but still complete all passes",
-    ]
+    ])
+
+    if normalized_review_mode in {"gate", "same_sha"}:
+        lines.extend(
+            [
+                "",
+                "## Incremental-mode override",
+                "",
+                "Because this is not a discovery sweep, treat the incremental diff artifacts as authoritative scope.",
+                "Prioritize blocker regressions (P0/P1) and revalidation of prior open findings.",
+                "Do not perform a fresh full-repository sweep for untouched files.",
+            ]
+        )
 
     if normalized_repository_owner:
         lines.extend(
@@ -694,10 +808,17 @@ def build_review_prompt(
         for index, raw_finding in enumerate(prior_open_findings or [])
     ]
     if normalized_prior_findings:
+        if normalized_review_mode == "discovery":
+            prior_findings_header = "Revalidate these currently open Codex findings before the full blocker-first sweep across the diff:"
+        elif normalized_review_mode == "gate":
+            prior_findings_header = "Revalidate these currently open Codex findings before the blocker-focused incremental sweep:"
+        else:
+            prior_findings_header = "Revalidate these currently open Codex findings for this same-SHA run:"
+
         lines.extend(
             [
                 "",
-                "Revalidate these currently open Codex findings before the full blocker-first sweep across the diff:",
+                prior_findings_header,
             ]
         )
         for finding in normalized_prior_findings:
@@ -796,6 +917,41 @@ def plan_thread_actions(
             thread = all_by_signature.get(signature)
             if thread and thread["thread_id"] not in used_thread_ids:
                 matched_thread = thread
+
+        # Fuzzy matching fallback: same path, title overlap, line proximity
+        if matched_thread is None:
+            finding_path = planned_finding.get("path", "")
+            finding_title = planned_finding.get("title", "")
+            # First try unresolved threads, then all threads
+            fuzzy_candidates = list(unresolved_by_fingerprint.values()) + list(all_by_fingerprint.values())
+            best_fuzzy_thread: dict[str, Any] | None = None
+            best_fuzzy_score = 0.0
+            TITLE_OVERLAY_THRESHOLD = 0.5
+            LINE_TOLERANCE = 5
+            for fuzzy_thread in fuzzy_candidates:
+                if fuzzy_thread["thread_id"] in used_thread_ids:
+                    continue
+                thread_finding = fuzzy_thread.get("finding")
+                if not isinstance(thread_finding, dict):
+                    continue
+                # Must have same path
+                if thread_finding.get("path") != finding_path:
+                    continue
+                # Check title overlap
+                thread_title = thread_finding.get("title", "")
+                overlap_score = _title_overlap_score(finding_title, thread_title)
+                if overlap_score < TITLE_OVERLAY_THRESHOLD:
+                    continue
+                # Check line distance tolerance
+                if not _line_distance_tolerance(planned_finding, thread_finding, tolerance=LINE_TOLERANCE):
+                    continue
+                # Take the best scoring match
+                if overlap_score > best_fuzzy_score:
+                    best_fuzzy_score = overlap_score
+                    best_fuzzy_thread = fuzzy_thread
+            if best_fuzzy_thread is not None:
+                matched_thread = best_fuzzy_thread
+                planned_finding["fuzzy_matched"] = True
 
         if matched_thread is not None:
             thread_id = matched_thread["thread_id"]

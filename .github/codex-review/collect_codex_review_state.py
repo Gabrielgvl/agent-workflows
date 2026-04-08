@@ -34,6 +34,8 @@ def main() -> int:
     head_sha = os.environ.get("CODEX_REVIEW_HEAD_SHA", "")
     codex_exit_code = _to_int("CODEX_REVIEW_EXIT_CODE", "1")
     max_inline_comments = _to_int("CODEX_REVIEW_MAX_INLINE_COMMENTS", "10")
+    review_mode = os.environ.get("CODEX_REVIEW_MODE", "discovery")
+    review_previous_head_sha = os.environ.get("CODEX_REVIEW_PREVIOUS_HEAD_SHA", "")
 
     state: dict[str, object] = {
         "codex_exit_code": codex_exit_code,
@@ -43,6 +45,8 @@ def main() -> int:
         "review_base": review_base,
         "head_sha": head_sha,
         "max_inline_comments": max_inline_comments,
+        "review_mode": review_mode,
+        "previous_head_sha": review_previous_head_sha,
         "overall_correctness": "",
         "overall_explanation": "",
         "overall_confidence_score": None,

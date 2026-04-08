@@ -232,6 +232,68 @@ jobs:
             echo "::warning::stdbuf was not found; codex output will still run, but line buffering may be coarser."
           fi
 
+      - name: Compute review mode
+        id: review_mode
+        uses: actions/github-script@v7
+        env:
+          CURRENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const currentHeadSha = process.env.CURRENT_HEAD_SHA || "";
+            const prNumber = Number(process.env.PR_NUMBER || "0");
+
+            if (!currentHeadSha || !prNumber) {
+              core.setOutput("mode", "discovery");
+              core.setOutput("previous_head_sha", "");
+              return;
+            }
+
+            // Find the single most recent completed codex-pr-review workflow run for this PR
+            // (excluding the current in-progress run identified by GITHUB_RUN_ID)
+            const currentRunId = Number(process.env.GITHUB_RUN_ID || "0");
+
+            const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+              owner,
+              repo,
+              workflow_id: "codex-pr-review.yml",
+              event: "pull_request",
+              status: "completed",
+              per_page: 100,
+            });
+
+            // Filter to runs for this PR (check pull_request.number in the run's pull_requests array)
+            // and exclude the current run
+            const prRuns = runs.filter((run) => {
+              const prs = run.pull_requests || [];
+              const matchesPR = prs.some((pr) => pr.number === prNumber);
+              const notCurrentRun = run.id !== currentRunId;
+              return matchesPR && notCurrentRun;
+            });
+
+            if (prRuns.length === 0) {
+              // No prior completed run exists for this PR
+              core.setOutput("mode", "discovery");
+              core.setOutput("previous_head_sha", "");
+              return;
+            }
+
+            // Sort by created_at descending and take the single most recent prior run
+            prRuns.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+            const latestPriorRun = prRuns[0];
+
+            if (latestPriorRun.head_sha === currentHeadSha) {
+              // Most recent prior run has same head SHA as current -> no new changes
+              core.setOutput("mode", "same_sha");
+              core.setOutput("previous_head_sha", currentHeadSha);
+              return;
+            }
+
+            // Most recent prior run has different head SHA -> gate mode with that SHA as previous_head_sha
+            core.setOutput("mode", "gate");
+            core.setOutput("previous_head_sha", latestPriorRun.head_sha || "");
+
       - name: Fetch base branch
         shell: bash
         working-directory: ${{ inputs.working_directory }}
@@ -275,6 +337,8 @@ jobs:
           CODEX_REVIEW_REASONING_EFFORT: ${{ inputs.review_reasoning_effort }}
           CODEX_REVIEW_REASONING_SUMMARY: ${{ inputs.review_reasoning_summary }}
           CODEX_REVIEW_VERBOSITY: ${{ inputs.review_verbosity }}
+          CODEX_REVIEW_MODE: ${{ steps.review_mode.outputs.mode }}
+          CODEX_REVIEW_PREVIOUS_HEAD_SHA: ${{ steps.review_mode.outputs.previous_head_sha }}
         run: |
           set +e
           "${WORKFLOW_HELPERS_DIR}/run_codex_review.sh"
@@ -299,6 +363,8 @@ jobs:
           CODEX_REVIEW_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CODEX_REVIEW_EXIT_CODE: ${{ steps.review.outputs.codex_exit_code }}
           CODEX_REVIEW_MAX_INLINE_COMMENTS: ${{ inputs.max_inline_comments }}
+          CODEX_REVIEW_MODE: ${{ steps.review_mode.outputs.mode }}
+          CODEX_REVIEW_PREVIOUS_HEAD_SHA: ${{ steps.review_mode.outputs.previous_head_sha }}
         run: |
           set -euo pipefail
           python3 "${WORKFLOW_HELPERS_DIR}/collect_codex_review_state.py"

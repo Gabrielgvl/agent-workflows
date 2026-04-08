@@ -522,5 +522,312 @@ class ThreadActionPlanningTests(unittest.TestCase):
         )
 
 
+
+
+class FingerprintStabilityTests(unittest.TestCase):
+    def test_fingerprint_stable_across_body_and_priority_changes(self) -> None:
+        """Fingerprint should not change when body wording or priority changes."""
+        # Same title, path, and lines but different body and priority
+        fp1 = lib._compute_fingerprint(
+            priority=0,
+            title="Missing null check in cleanup path",
+            body="The cleanup function dereferences a null pointer when result is empty.",
+            path="src/app.py",
+            start_line=23,
+            end_line=25,
+        )
+        fp2 = lib._compute_fingerprint(
+            priority=2,
+            title="Missing null check in cleanup path",
+            body="Different wording: cleanup crashes on empty result due to missing null guard.",
+            path="src/app.py",
+            start_line=23,
+            end_line=25,
+        )
+        self.assertEqual(fp1, fp2, "Fingerprint should be stable across body/priority changes")
+        self.assertEqual(len(fp1), 16, "Fingerprint should be 16 hex chars")
+
+    def test_fingerprint_changes_with_different_title(self) -> None:
+        """Fingerprint should change when title changes significantly."""
+        fp1 = lib._compute_fingerprint(
+            priority=1,
+            title="Missing null check",
+            body="Issue description",
+            path="src/app.py",
+            start_line=23,
+            end_line=25,
+        )
+        fp2 = lib._compute_fingerprint(
+            priority=1,
+            title="Broken error handling",
+            body="Issue description",
+            path="src/app.py",
+            start_line=23,
+            end_line=25,
+        )
+        self.assertNotEqual(fp1, fp2, "Fingerprint should differ for different titles")
+
+    def test_fingerprint_changes_with_different_lines(self) -> None:
+        """Fingerprint should change when line numbers change."""
+        fp1 = lib._compute_fingerprint(
+            priority=1,
+            title="Missing null check",
+            body="Issue description",
+            path="src/app.py",
+            start_line=23,
+            end_line=25,
+        )
+        fp2 = lib._compute_fingerprint(
+            priority=1,
+            title="Missing null check",
+            body="Issue description",
+            path="src/app.py",
+            start_line=30,
+            end_line=32,
+        )
+        self.assertNotEqual(fp1, fp2, "Fingerprint should differ for different line ranges")
+
+    def test_fingerprint_normalized_title_punctuation_ignored(self) -> None:
+        """Punctuation differences in title should not affect fingerprint."""
+        fp1 = lib._compute_fingerprint(
+            priority=1,
+            title="Missing null check in cleanup",
+            body="Issue description",
+            path="src/app.py",
+            start_line=23,
+            end_line=25,
+        )
+        fp2 = lib._compute_fingerprint(
+            priority=1,
+            title="Missing null check in cleanup!",  # Only trailing punctuation differs
+            body="Issue description",
+            path="src/app.py",
+            start_line=23,
+            end_line=25,
+        )
+        self.assertEqual(fp1, fp2, "Trailing punctuation should be normalized away")
+
+
+class FuzzyMatchingTests(unittest.TestCase):
+    def test_fuzzy_matching_same_path_similar_title_near_lines(self) -> None:
+        """Fuzzy matching should map near-line/similar-title finding to existing thread."""
+        # Create a managed thread with slightly different title and lines
+        managed_threads = [
+            {
+                "thread_id": "thread-fuzzy-match",
+                "is_resolved": False,
+                "fingerprint": "oldfingerprint123",
+                "finding": {
+                    "priority": 1,
+                    "priority_label": "P1",
+                    "title": "Missing null check in cleanup handler",
+                    "body": "The cleanup function may crash.",
+                    "path": "src/app.py",
+                    "start_line": 20,
+                    "end_line": 22,
+                    "confidence_score": 0.71,
+                    "category": "correctness",
+                    "suggested_fix": "Add null check.",
+                },
+            },
+        ]
+        # New finding with similar title, same path, nearby lines (within 5 tolerance)
+        findings = [
+            {
+                "priority": 1,
+                "priority_label": "P1",
+                "title": "Missing null check in cleanup path",
+                # Similar tokens: "missing", "null", "check", "cleanup"
+                "body": "Updated wording.",
+                "path": "src/app.py",
+                "start_line": 23,  # 3 lines away from 20
+                "end_line": 24,    # 2 lines away from 22
+                "confidence_score": 0.80,
+                "category": "correctness",
+                "suggested_fix": "Add null guard.",
+                "fingerprint": "newfingerprint456",
+                "previous_fingerprint": None,
+                "inline_placeable": True,
+            },
+        ]
+
+        plan = lib.plan_thread_actions(
+            findings,
+            managed_threads=managed_threads,
+            max_inline_comments=10,
+        )
+
+        # Should match via fuzzy matching
+        self.assertEqual(len(plan["create_inline_findings"]), 0, "Should not create new thread")
+        self.assertEqual(plan["thread_lifecycle_counts"]["new"], 0)
+        self.assertEqual(plan["thread_lifecycle_counts"]["still_open"], 1)
+        # Check that fuzzy_matched flag is set
+        self.assertTrue(plan["planned_findings"][0].get("fuzzy_matched"), "Should be marked as fuzzy matched")
+
+    def test_fuzzy_matching_requires_title_overlap_threshold(self) -> None:
+        """Fuzzy matching should not match if title overlap is below threshold."""
+        managed_threads = [
+            {
+                "thread_id": "thread-no-match",
+                "is_resolved": False,
+                "fingerprint": "oldfp001",
+                "finding": {
+                    "priority": 1,
+                    "priority_label": "P1",
+                    "title": "Database connection timeout issue",
+                    "body": "Connection times out.",
+                    "path": "src/db.py",
+                    "start_line": 10,
+                    "end_line": 12,
+                    "confidence_score": 0.7,
+                    "category": "performance",
+                    "suggested_fix": "Increase timeout.",
+                },
+            },
+        ]
+        # New finding with completely different title (no overlap)
+        findings = [
+            {
+                "priority": 1,
+                "priority_label": "P1",
+                "title": "Memory leak in allocator",
+                "body": "Memory not freed.",
+                "path": "src/db.py",
+                "start_line": 11,
+                "end_line": 13,
+                "confidence_score": 0.8,
+                "category": "correctness",
+                "suggested_fix": "Free memory.",
+                "fingerprint": "newfp002",
+                "previous_fingerprint": None,
+                "inline_placeable": True,
+            },
+        ]
+
+        plan = lib.plan_thread_actions(
+            findings,
+            managed_threads=managed_threads,
+            max_inline_comments=10,
+        )
+
+        # Should NOT match (different title)
+        self.assertEqual(len(plan["create_inline_findings"]), 1, "Should create new thread")
+        self.assertEqual(plan["thread_lifecycle_counts"]["new"], 1)
+
+    def test_fuzzy_matching_requires_same_path(self) -> None:
+        """Fuzzy matching should not match across different paths."""
+        managed_threads = [
+            {
+                "thread_id": "thread-diff-path",
+                "is_resolved": False,
+                "fingerprint": "oldfp003",
+                "finding": {
+                    "priority": 1,
+                    "priority_label": "P1",
+                    "title": "Missing null check",
+                    "body": "Null pointer.",
+                    "path": "src/app.py",
+                    "start_line": 20,
+                    "end_line": 22,
+                    "confidence_score": 0.7,
+                    "category": "correctness",
+                    "suggested_fix": "Add check.",
+                },
+            },
+        ]
+        # New finding with similar title but different path
+        findings = [
+            {
+                "priority": 1,
+                "priority_label": "P1",
+                "title": "Missing null check in handler",
+                "body": "Updated.",
+                "path": "src/handler.py",  # Different path
+                "start_line": 21,
+                "end_line": 23,
+                "confidence_score": 0.8,
+                "category": "correctness",
+                "suggested_fix": "Add check.",
+                "fingerprint": "newfp004",
+                "previous_fingerprint": None,
+                "inline_placeable": True,
+            },
+        ]
+
+        plan = lib.plan_thread_actions(
+            findings,
+            managed_threads=managed_threads,
+            max_inline_comments=10,
+        )
+
+        # Should NOT match (different path)
+        self.assertEqual(len(plan["create_inline_findings"]), 1, "Should create new thread")
+
+
+class ReviewModeTests(unittest.TestCase):
+    def test_discovery_mode_prompt_contains_full_sweep_instructions(self) -> None:
+        """Discovery mode should include exhaustive review instructions."""
+        prompt = lib.build_review_prompt(
+            review_base="main",
+            base_sha="a" * 40,
+            merge_base="b" * 40,
+            head_sha="c" * 40,
+            changed_files_filename="files.txt",
+            diff_filename="diff.txt",
+            review_mode="discovery",
+        )
+        self.assertIn("Discovery Review Mode", prompt)
+        self.assertIn("full exhaustive review", prompt)
+        self.assertIn("Multi-Pass Review Methodology", prompt)
+
+    def test_gate_mode_prompt_contains_incremental_instructions(self) -> None:
+        """Gate mode should include incremental review instructions."""
+        prompt = lib.build_review_prompt(
+            review_base="main",
+            base_sha="a" * 40,
+            merge_base="b" * 40,
+            head_sha="c" * 40,
+            changed_files_filename="files.txt",
+            diff_filename="diff.txt",
+            review_mode="gate",
+            previous_head_sha="abc123def456",
+        )
+        self.assertIn("Incremental Review Mode", prompt)
+        self.assertIn("incremental review", prompt)
+        self.assertIn("abc123def456...HEAD", prompt)
+        self.assertIn("P0/P1 regression detection", prompt)
+        self.assertIn("Revalidate prior open findings", prompt)
+        # Gate mode should NOT require exhaustive coverage
+        self.assertIn("does NOT require exhaustive", prompt)
+
+    def test_same_sha_mode_prompt_contains_revalidation_only(self) -> None:
+        """Same SHA mode should focus on revalidation only."""
+        prompt = lib.build_review_prompt(
+            review_base="main",
+            base_sha="a" * 40,
+            merge_base="b" * 40,
+            head_sha="c" * 40,
+            changed_files_filename="files.txt",
+            diff_filename="diff.txt",
+            review_mode="same_sha",
+        )
+        self.assertIn("Same SHA Review Mode", prompt)
+        self.assertIn("revalidating prior open findings", prompt)
+        self.assertIn("No new exhaustive sweep", prompt)
+
+    def test_invalid_review_mode_raises_error(self) -> None:
+        """Invalid review_mode should raise ValueError."""
+        with self.assertRaisesRegex(ValueError, "review_mode must be one of"):
+            lib.build_review_prompt(
+                review_base="main",
+                base_sha="a" * 40,
+                merge_base="b" * 40,
+                head_sha="c" * 40,
+                changed_files_filename="files.txt",
+                diff_filename="diff.txt",
+                review_mode="invalid_mode",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

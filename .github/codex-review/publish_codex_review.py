@@ -9,7 +9,12 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from codex_review_lib import build_inline_comment_body, plan_thread_actions, render_summary_body
+from codex_review_lib import (
+    build_inline_comment_body,
+    extract_inline_fingerprint,
+    plan_thread_actions,
+    render_summary_body,
+)
 
 
 def _env(name: str, default: str | None = None) -> str:
@@ -81,6 +86,7 @@ def _delete_managed_review_comments(
     repo: str,
     pull_number: str,
     token: str,
+    fingerprints: set[str] | None = None,
 ) -> None:
     comments = _paginate(
         f"{api_url}/repos/{owner}/{repo}/pulls/{pull_number}/comments",
@@ -90,7 +96,10 @@ def _delete_managed_review_comments(
         body = comment.get("body") or ""
         if comment.get("user", {}).get("type") != "Bot":
             continue
-        if "<!-- codex-pr-review-inline:" not in body:
+        inline_fingerprint = extract_inline_fingerprint(str(body))
+        if not inline_fingerprint:
+            continue
+        if fingerprints is not None and inline_fingerprint not in fingerprints:
             continue
         status, payload = _request(
             "DELETE",
@@ -269,13 +278,40 @@ def main() -> int:
             max_inline_comments=int(state.get("max_inline_comments", 10)),
         )
 
-        _delete_managed_review_comments(
-            api_url=api_url,
-            owner=owner,
-            repo=repo,
-            pull_number=pull_number,
-            token=token,
-        )
+        resolve_thread_ids = set(action_plan["resolve_thread_ids"])
+        resolve_fingerprints = {
+            str(thread.get("fingerprint"))
+            for thread in managed_threads
+            if thread.get("thread_id") in resolve_thread_ids and isinstance(thread.get("fingerprint"), str)
+        }
+        if resolve_fingerprints:
+            _delete_managed_review_comments(
+                api_url=api_url,
+                owner=owner,
+                repo=repo,
+                pull_number=pull_number,
+                token=token,
+                fingerprints=resolve_fingerprints,
+            )
+
+        reopen_inline_findings = [
+            finding
+            for finding in action_plan.get("planned_findings", [])
+            if finding.get("thread_action") == "reopen"
+            and finding.get("priority", 99) <= 1
+            and finding.get("inline_placeable")
+        ]
+        findings_to_post = list(action_plan["create_inline_findings"]) + reopen_inline_findings
+
+        deduped_findings: list[dict[str, Any]] = []
+        seen_fingerprints: set[str] = set()
+        for finding in findings_to_post:
+            fingerprint = str(finding.get("fingerprint") or "")
+            if fingerprint and fingerprint in seen_fingerprints:
+                continue
+            if fingerprint:
+                seen_fingerprints.add(fingerprint)
+            deduped_findings.append(finding)
 
         posted_inline_count, unplaced_inline_count, truncated_inline_count = _post_inline_comments(
             api_url=api_url,
@@ -284,7 +320,7 @@ def main() -> int:
             pull_number=pull_number,
             head_sha=head_sha,
             token=token,
-            findings=state.get("findings", []),
+            findings=deduped_findings,
             initial_unplaced_count=int(state.get("unplaced_inline_count", 0)),
             initial_truncated_count=int(state.get("truncated_inline_count", 0)),
         )

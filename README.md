@@ -55,8 +55,6 @@ on:
       - synchronize
       - reopened
       - ready_for_review
-      - labeled
-      - unlabeled
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -123,11 +121,17 @@ jobs:
   first-party infrastructure, so it does not raise supply-chain findings solely
   because those refs use a major tag such as `@v1`.
 - Unresolved managed findings from the previous bot run are fed back into the
-  next Codex prompt so reruns revalidate prior issues as part of a full
-  blocker-first sweep across the diff.
-- Managed inline comments are refreshed on reruns. GitHub's default workflow
-  token cannot resolve review threads, so the workflow keeps rerun context in
-  the prompt and sticky summary instead of mutating thread state in place.
+  next Codex prompt so reruns revalidate prior issues.
+- The workflow auto-selects a review mode to prevent rerun churn:
+  - `discovery`: first completed run for a PR performs the full exhaustive sweep
+    over `origin/<base>...HEAD`.
+  - `gate`: later runs review only incremental changes from the most recent
+    completed review SHA to `HEAD`, while revalidating prior open findings.
+  - `same_sha`: if no code changed since the latest completed review, the
+    workflow skips Codex execution and reuses prior open findings state.
+- Managed inline comments are now incrementally reconciled: newly discovered
+  blockers are posted, reopened blockers are re-posted, and findings that no
+  longer appear can be pruned without deleting every managed comment on each run.
 - The caller workflow must grant `actions: read` so the reusable workflow can
   resolve its own pinned source from the current run metadata.
 - The review helper runs Codex with `--sandbox danger-full-access`. This is
