@@ -477,6 +477,7 @@ jobs:
             ${{ inputs.working_directory }}/codex-review-prior-open-findings.json
             ${{ inputs.working_directory }}/codex-review-state.json
             ${{ inputs.working_directory }}/codex-review-state.env
+            ${{ inputs.working_directory }}/codex-review-effective-previous-head-sha.txt
           if-no-files-found: ignore
           retention-days: 7
 

@@ -37,6 +37,12 @@ def main() -> int:
     review_mode = os.environ.get("CODEX_REVIEW_MODE", "discovery")
     review_previous_head_sha = os.environ.get("CODEX_REVIEW_PREVIOUS_HEAD_SHA", "")
 
+    # Read effective previous_head_sha (accounts for rebase detection in run_codex_review.sh)
+    effective_previous_head_sha_path = Path("codex-review-effective-previous-head-sha.txt")
+    effective_previous_head_sha = ""
+    if effective_previous_head_sha_path.exists():
+        effective_previous_head_sha = effective_previous_head_sha_path.read_text(encoding="utf-8").strip()
+
     state: dict[str, object] = {
         "codex_exit_code": codex_exit_code,
         "parse_failed": False,
@@ -47,6 +53,7 @@ def main() -> int:
         "max_inline_comments": max_inline_comments,
         "review_mode": review_mode,
         "previous_head_sha": review_previous_head_sha,
+        "effective_previous_head_sha": effective_previous_head_sha or None,
         "overall_correctness": "",
         "overall_explanation": "",
         "overall_confidence_score": None,

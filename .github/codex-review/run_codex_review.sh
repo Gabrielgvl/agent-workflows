@@ -242,17 +242,32 @@ SYNTHESIZE_PY
 fi
 
 # Compute diff base based on mode
+# Detect rebase: if previous_head_sha is not an ancestor of HEAD, use merge-base instead
 diff_base_ref=""
 diff_base_sha=""
+effective_previous_head_sha="$review_previous_head_sha"  # For prompt generation
 if [[ "$review_mode" == "gate" && -n "$review_previous_head_sha" ]]; then
   # Gate mode: try to use previous_head_sha as diff base
   if git rev-parse --verify "$review_previous_head_sha" >/dev/null 2>&1; then
-    diff_base_sha="$review_previous_head_sha"
-    log_info "Review mode: gate (diff base: previous_head_sha=${review_previous_head_sha})"
+    # Check if previous_head_sha is an ancestor of HEAD (no rebase)
+    if git merge-base --is-ancestor "$review_previous_head_sha" "$head_sha" 2>/dev/null; then
+      # Normal case: previous_head_sha is ancestor, use it as diff base
+      diff_base_sha="$review_previous_head_sha"
+      log_info "Review mode: gate (diff base: previous_head_sha=${review_previous_head_sha}, no rebase detected)"
+    else
+      # Rebase detected: previous_head_sha is not an ancestor of HEAD
+      # Fall back to merge-base against origin/main to avoid reviewing rebased changes
+      log_info "Review mode: gate (rebase detected: previous_head_sha=${review_previous_head_sha} is not ancestor of HEAD)"
+      log_info "Falling back to origin/${review_base} as diff base"
+      diff_base_ref="$review_base_ref"
+      diff_base_sha="$base_sha"
+      effective_previous_head_sha=""  # Clear for prompt: this is now a discovery-style review
+    fi
   else
     log_info "Review mode: gate (previous_head_sha invalid, falling back to origin/${review_base})"
     diff_base_ref="$review_base_ref"
     diff_base_sha="$base_sha"
+    effective_previous_head_sha=""  # Clear for prompt
   fi
 else
   # Discovery mode or gate mode without valid previous_head_sha
@@ -260,6 +275,9 @@ else
   diff_base_sha="$base_sha"
   log_info "Review mode: ${review_mode} (diff base: origin/${review_base})"
 fi
+
+# Export effective previous_head_sha for state collection
+echo "$effective_previous_head_sha" > codex-review-effective-previous-head-sha.txt
 
 if [[ -n "$diff_base_ref" ]]; then
   if ! merge_base="$(git merge-base "$head_sha" "$diff_base_sha")"; then
@@ -477,7 +495,7 @@ cat > "$schema_path" <<'JSON'
 }
 JSON
 
-prior_open_findings_count="$(python3 - "$workflow_helpers_dir/codex_review_lib.py" "$prompt_path" "$review_base" "$diff_base_sha" "$merge_base" "$head_sha" "$(basename "$changed_files_path")" "$(basename "$diff_path")" "$repository_owner" "$prior_open_findings_path" "$review_mode" "$review_previous_head_sha" <<'PY'
+prior_open_findings_count="$(python3 - "$workflow_helpers_dir/codex_review_lib.py" "$prompt_path" "$review_base" "$diff_base_sha" "$merge_base" "$head_sha" "$(basename "$changed_files_path")" "$(basename "$diff_path")" "$repository_owner" "$prior_open_findings_path" "$review_mode" "$effective_previous_head_sha" <<'PY'
 import importlib.util
 import json
 import pathlib
